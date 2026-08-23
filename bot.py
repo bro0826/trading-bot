@@ -77,7 +77,7 @@ def fetch_and_verify_macro_news():
         return {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Fallback neutral sentiment."}
 
 # ==========================================
-# 3. MARKET DATA & METRICS
+# 3. ICT / FVG & ADVANCED QUANT METRICS
 # ==========================================
 def get_market_data(symbol):
     try:
@@ -100,27 +100,68 @@ def get_market_data(symbol):
         print(f"[WARNING] Could not fetch market bars for {symbol}: {e}")
         return None
 
-def calculate_advanced_metrics(df):
+def detect_fair_value_gaps_and_smc(df):
+    """
+    Detects Fair Value Gaps (FVG):
+      - BISI (Buyside Imbalance / Sellside Inefficiency) -> Bullish FVG: low[i] > high[i-2]
+      - SIBI (Sellside Imbalance / Buyside Inefficiency) -> Bearish FVG: high[i] < low[i-2]
+      - Consequent Encroachment (CE): 50% level of the gap.
+    Also calculates Premium/Discount arrays & ATR volatility.
+    """
     df['SMA_20'] = df['close'].rolling(window=20).mean()
     df['SMA_50'] = df['close'].rolling(window=50).mean()
     df['Swing_High'] = df['high'].rolling(window=5).max()
     df['Swing_Low'] = df['low'].rolling(window=5).min()
     
+    # ATR Volatility
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['ATR'] = ranges.max(axis=1).rolling(window=14).mean()
     
+    # FVG Detection Lists & Flags
+    bisi_list = [] # Bullish FVG
+    sibi_list = [] # Bearish FVG
+    
+    for i in range(2, len(df)):
+        # Bullish FVG (BISI): Candle 1 high is lower than Candle 3 low
+        if df['low'].iloc[i] > df['high'].iloc[i-2]:
+            fvg_bottom = df['high'].iloc[i-2]
+            fvg_top = df['low'].iloc[i]
+            ce = (fvg_top + fvg_bottom) / 2.0
+            bisi_list.append({'index': i, 'bottom': fvg_bottom, 'top': fvg_top, 'ce': ce})
+            
+        # Bearish FVG (SIBI): Candle 1 low is higher than Candle 3 high
+        if df['high'].iloc[i] < df['low'].iloc[i-2]:
+            fvg_top = df['low'].iloc[i-2]
+            fvg_bottom = df['high'].iloc[i]
+            ce = (fvg_top + fvg_bottom) / 2.0
+            sibi_list.append({'index': i, 'bottom': fvg_bottom, 'top': fvg_top, 'ce': ce})
+
+    # Advanced theory: Premium vs Discount Array (equilibrium of recent range)
+    recent_high = df['high'].rolling(window=50).max().iloc[-1]
+    recent_low = df['low'].rolling(window=50).min().iloc[-1]
+    equilibrium = (recent_high + recent_low) / 2.0
     current_close = df['close'].iloc[-1]
+    
+    is_in_discount = current_close < equilibrium # Optimal for buying long setups (bullish FVG context)
+
+    # Risk-Reward calculations
     atr = df['ATR'].iloc[-1]
     swing_low = df['Swing_Low'].iloc[-1]
-    
     risk = current_close - swing_low if current_close > swing_low else atr
-    risk = max(risk, atr * 0.5) 
+    risk = max(risk, atr * 0.5)
     reward = df['Swing_High'].iloc[-1] - current_close
-    df['Calculated_RR'] = reward / risk if risk > 0 else 0.0
-    return df
+    rr_ratio = reward / risk if risk > 0 else 0.0
+
+    df['Calculated_RR'] = rr_ratio
+    
+    # Store latest FVG state for evaluation
+    latest_bisi = bisi_list[-1] if bisi_list else None
+    latest_sibi = sibi_list[-1] if sibi_list else None
+    
+    return df, latest_bisi, latest_sibi, is_in_discount
 
 def deterministic_pre_screen(symbols):
     candidates = []
@@ -128,21 +169,30 @@ def deterministic_pre_screen(symbols):
         try:
             df = get_market_data(symbol)
             if df is not None and len(df) > 50:
-                df = calculate_advanced_metrics(df)
+                df, bisi, sibi, is_discount = detect_fair_value_gaps_and_smc(df)
                 current_price = df['close'].iloc[-1]
                 sma_20 = df['SMA_20'].iloc[-1]
                 sma_50 = df['SMA_50'].iloc[-1]
                 is_bullish_trend = (current_price > sma_20) and (sma_20 > sma_50)
                 
+                # Check if price respects Bullish FVG (BISI) Consequent Encroachment or Discount array
+                fvg_respected = False
+                if bisi and current_price >= bisi['ce']:
+                    fvg_respected = True
+
                 candidates.append({
                     "symbol": symbol,
                     "price": round(current_price, 2),
                     "risk_reward_ratio": round(df['Calculated_RR'].iloc[-1], 2),
-                    "bullish_trend": is_bullish_trend
+                    "bullish_trend": is_bullish_trend,
+                    "is_discount": is_discount,
+                    "fvg_respected": fvg_respected,
+                    "has_bisi": bisi is not None
                 })
         except Exception as e:
             print(f"[WARNING] Skipping symbol {symbol} due to calculation error: {e}")
-    candidates.sort(key=lambda x: x['risk_reward_ratio'], reverse=True)
+            
+    candidates.sort(key=lambda x: (x['risk_reward_ratio'], x['fvg_respected']), reverse=True)
     return candidates
 
 # ==========================================
@@ -165,9 +215,10 @@ def execute_trades(candidates, macro_score):
         return
 
     for candidate in candidates:
-        if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.5:
+        # Require bullish trend, healthy risk-reward, and alignment with discount pricing / FVG mitigation
+        if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.5 and candidate['is_discount']:
             symbol = candidate['symbol']
-            print(f"[EXECUTION] Submitting market order for {symbol} (Notional: ${NOTIONAL_PER_TRADE})")
+            print(f"[EXECUTION] SMC Confluence met for {symbol}. Submitting market order (Notional: ${NOTIONAL_PER_TRADE})")
             try:
                 order_data = MarketOrderRequest(
                     symbol=symbol,
@@ -185,7 +236,7 @@ def execute_trades(candidates, macro_score):
 # 5. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting autonomous trading agent cycle...")
+    print("Starting autonomous ICT/SMC trading agent cycle...")
     
     try:
         macro_data = fetch_and_verify_macro_news()
@@ -195,7 +246,7 @@ if __name__ == "__main__":
     
     try:
         ranked_watchlist = deterministic_pre_screen(SYMBOLS)
-        print(f"[INFO] Watchlist pre-screened candidates: {ranked_watchlist}")
+        print(f"[INFO] Watchlist pre-screened FVG candidates: {ranked_watchlist}")
         execute_trades(ranked_watchlist, macro_score)
     except Exception as e:
         print(f"[WARNING] Cycle completed with warnings: {e}")
