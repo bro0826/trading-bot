@@ -1,0 +1,6 @@
+pandas
+numpy
+alpaca-py
+openai
+google-genai
+requests
