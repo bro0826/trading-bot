@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -49,7 +49,6 @@ NOTIONAL_PER_TRADE = 1000.0
 # ==========================================
 def fetch_and_verify_macro_news():
     print("[MACRO AGENT] Querying live global news & politics via Gemini...")
-    
     prompt = (
         "Search the live web for breaking global news, geopolitical events, and major economic factors "
         "over the last 24-48 hours that impact global stock markets. "
@@ -58,7 +57,6 @@ def fetch_and_verify_macro_news():
         "Respond strictly in JSON format with keys: 'macro_sentiment_score' (float), "
         "'verified_headlines' (list of strings), and 'summary_reasoning' (string)."
     )
-    
     try:
         response = gemini_client.models.generate_content(
             model="gemini-3.6-flash",
@@ -77,7 +75,7 @@ def fetch_and_verify_macro_news():
         return {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Fallback neutral sentiment."}
 
 # ==========================================
-# 3. ICT / FVG & ADVANCED QUANT METRICS
+# 3. ICT / FVG & QUANT METRICS
 # ==========================================
 def get_market_data(symbol):
     try:
@@ -101,53 +99,31 @@ def get_market_data(symbol):
         return None
 
 def detect_fair_value_gaps_and_smc(df):
-    """
-    Detects Fair Value Gaps (FVG):
-      - BISI (Buyside Imbalance / Sellside Inefficiency) -> Bullish FVG: low[i] > high[i-2]
-      - SIBI (Sellside Imbalance / Buyside Inefficiency) -> Bearish FVG: high[i] < low[i-2]
-      - Consequent Encroachment (CE): 50% level of the gap.
-    Also calculates Premium/Discount arrays & ATR volatility.
-    """
     df['SMA_20'] = df['close'].rolling(window=20).mean()
     df['SMA_50'] = df['close'].rolling(window=50).mean()
     df['Swing_High'] = df['high'].rolling(window=5).max()
     df['Swing_Low'] = df['low'].rolling(window=5).min()
     
-    # ATR Volatility
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['ATR'] = ranges.max(axis=1).rolling(window=14).mean()
     
-    # FVG Detection Lists & Flags
-    bisi_list = [] # Bullish FVG
-    sibi_list = [] # Bearish FVG
-    
+    bisi_list = [] 
     for i in range(2, len(df)):
-        # Bullish FVG (BISI): Candle 1 high is lower than Candle 3 low
         if df['low'].iloc[i] > df['high'].iloc[i-2]:
             fvg_bottom = df['high'].iloc[i-2]
             fvg_top = df['low'].iloc[i]
             ce = (fvg_top + fvg_bottom) / 2.0
             bisi_list.append({'index': i, 'bottom': fvg_bottom, 'top': fvg_top, 'ce': ce})
-            
-        # Bearish FVG (SIBI): Candle 1 low is higher than Candle 3 high
-        if df['high'].iloc[i] < df['low'].iloc[i-2]:
-            fvg_top = df['low'].iloc[i-2]
-            fvg_bottom = df['high'].iloc[i]
-            ce = (fvg_top + fvg_bottom) / 2.0
-            sibi_list.append({'index': i, 'bottom': fvg_bottom, 'top': fvg_top, 'ce': ce})
 
-    # Advanced theory: Premium vs Discount Array (equilibrium of recent range)
     recent_high = df['high'].rolling(window=50).max().iloc[-1]
     recent_low = df['low'].rolling(window=50).min().iloc[-1]
     equilibrium = (recent_high + recent_low) / 2.0
     current_close = df['close'].iloc[-1]
-    
-    is_in_discount = current_close < equilibrium # Optimal for buying long setups (bullish FVG context)
+    is_in_discount = current_close < equilibrium
 
-    # Risk-Reward calculations
     atr = df['ATR'].iloc[-1]
     swing_low = df['Swing_Low'].iloc[-1]
     risk = current_close - swing_low if current_close > swing_low else atr
@@ -156,12 +132,9 @@ def detect_fair_value_gaps_and_smc(df):
     rr_ratio = reward / risk if risk > 0 else 0.0
 
     df['Calculated_RR'] = rr_ratio
-    
-    # Store latest FVG state for evaluation
     latest_bisi = bisi_list[-1] if bisi_list else None
-    latest_sibi = sibi_list[-1] if sibi_list else None
     
-    return df, latest_bisi, latest_sibi, is_in_discount
+    return df, latest_bisi, is_in_discount, atr, swing_low
 
 def deterministic_pre_screen(symbols):
     candidates = []
@@ -169,13 +142,12 @@ def deterministic_pre_screen(symbols):
         try:
             df = get_market_data(symbol)
             if df is not None and len(df) > 50:
-                df, bisi, sibi, is_discount = detect_fair_value_gaps_and_smc(df)
+                df, bisi, is_discount, atr, swing_low = detect_fair_value_gaps_and_smc(df)
                 current_price = df['close'].iloc[-1]
                 sma_20 = df['SMA_20'].iloc[-1]
                 sma_50 = df['SMA_50'].iloc[-1]
                 is_bullish_trend = (current_price > sma_20) and (sma_20 > sma_50)
                 
-                # Check if price respects Bullish FVG (BISI) Consequent Encroachment or Discount array
                 fvg_respected = False
                 if bisi and current_price >= bisi['ce']:
                     fvg_respected = True
@@ -187,7 +159,9 @@ def deterministic_pre_screen(symbols):
                     "bullish_trend": is_bullish_trend,
                     "is_discount": is_discount,
                     "fvg_respected": fvg_respected,
-                    "has_bisi": bisi is not None
+                    "atr": round(atr, 2),
+                    "suggested_stop_loss": round(current_price - (atr * 1.5), 2),
+                    "suggested_take_profit": round(current_price + (atr * 3.0), 2)
                 })
         except Exception as e:
             print(f"[WARNING] Skipping symbol {symbol} due to calculation error: {e}")
@@ -196,7 +170,45 @@ def deterministic_pre_screen(symbols):
     return candidates
 
 # ==========================================
-# 4. EXECUTION ENGINE
+# 4. GROQ AI VETO AGENT
+# ==========================================
+def groq_ai_risk_veto(candidate, macro_score):
+    print(f"[GROQ RISK AGENT] Evaluating trade viability for {candidate['symbol']}...")
+    
+    prompt = (
+        f"You are an elite risk management AI. Review the following trade candidate parameters:\n"
+        f"- Symbol: {candidate['symbol']}\n"
+        f"- Current Price: {candidate['price']}\n"
+        f"- Bullish Trend Confirmed: {candidate['bullish_trend']}\n"
+        f"- Risk/Reward Ratio: {candidate['risk_reward_ratio']}\n"
+        f"- Optimal Discount Zone: {candidate['is_discount']}\n"
+        f"- Fair Value Gap Respected: {candidate['fvg_respected']}\n"
+        f"- Macro Sentiment Score (-1 to 1): {macro_score}\n"
+        f"- Proposed Stop-Loss: {candidate['suggested_stop_loss']}\n"
+        f"- Proposed Take-Profit: {candidate['suggested_take_profit']}\n\n"
+        "Your job is to prevent dumb, high-risk trades. If market conditions look too choppy or risk is unfavorable, VETO it.\n"
+        "Respond strictly in JSON format with keys: 'approve' (boolean: true or false), and 'reasoning' (string)."
+    )
+    
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a strict risk management trading bot controller. Output only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+        result = json.loads(completion.choices[0].message.content)
+        print(f"[GROQ RISK AGENT] Decision for {candidate['symbol']} -> Approve: {result.get('approve')} | Reason: {result.get('reasoning')}")
+        return result.get('approve', False)
+    except Exception as e:
+        print(f"[WARNING] Groq API call failed, defaulting to veto for safety: {e}")
+        return False
+
+# ==========================================
+# 5. EXECUTION & AUTOMATED EXIT ENGINE
 # ==========================================
 def execute_trades(candidates, macro_score):
     if macro_score < -0.2:
@@ -215,28 +227,42 @@ def execute_trades(candidates, macro_score):
         return
 
     for candidate in candidates:
-        # Require bullish trend, healthy risk-reward, and alignment with discount pricing / FVG mitigation
-        if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.5 and candidate['is_discount']:
+        if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.2:
+            
+            # Run the candidate through Groq AI before letting it execute
+            is_approved_by_ai = groq_ai_risk_veto(candidate, macro_score)
+            
+            if not is_approved_by_ai:
+                print(f"[EXECUTION] Groq VETOED trade for {candidate['symbol']}. Skipping.")
+                continue
+
             symbol = candidate['symbol']
-            print(f"[EXECUTION] SMC Confluence met for {symbol}. Submitting market order (Notional: ${NOTIONAL_PER_TRADE})")
+            sl_price = candidate['suggested_stop_loss']
+            tp_price = candidate['suggested_take_profit']
+            
+            print(f"[EXECUTION] Submitting protected bracket order for {symbol} (Notional: ${NOTIONAL_PER_TRADE}) | TP: {tp_price} | SL: {sl_price}")
+            
             try:
+                # Alpaca Market Order with built-in Stop-Loss and Take-Profit exit brackets
                 order_data = MarketOrderRequest(
                     symbol=symbol,
                     notional=NOTIONAL_PER_TRADE,
                     side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
+                    take_profit=TakeProfitRequest(limit_price=tp_price),
+                    stop_loss=StopLossRequest(stop_price=sl_price)
                 )
                 order = trading_client.submit_order(order_data=order_data)
-                print(f"[SUCCESS] Order placed for {symbol}: {order.id}")
+                print(f"[SUCCESS] Protected order placed for {symbol}: {order.id}")
                 break 
             except Exception as e:
                 print(f"[ERROR] Failed to execute order for {symbol}: {e}")
 
 # ==========================================
-# 5. MAIN CONTROLLER LOOP
+# 6. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting autonomous ICT/SMC trading agent cycle...")
+    print("Starting hardened ICT/Groq AI autonomous trading cycle...")
     
     try:
         macro_data = fetch_and_verify_macro_news()
@@ -246,7 +272,7 @@ if __name__ == "__main__":
     
     try:
         ranked_watchlist = deterministic_pre_screen(SYMBOLS)
-        print(f"[INFO] Watchlist pre-screened FVG candidates: {ranked_watchlist}")
+        print(f"[INFO] Watchlist pre-screened candidates: {ranked_watchlist}")
         execute_trades(ranked_watchlist, macro_score)
     except Exception as e:
         print(f"[WARNING] Cycle completed with warnings: {e}")
