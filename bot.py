@@ -45,18 +45,22 @@ SYMBOLS = ["QQQ", "AAPL", "NVDA", "MSFT", "META", "GOOGL"]
 NOTIONAL_PER_TRADE = 1000.0
 
 # ==========================================
-# 2. MACRO NEWS & GEMINI ENGINE
+# 2. FACT-CHECKED POLITICAL & MACRO ENGINE
 # ==========================================
 def fetch_and_verify_macro_news():
-    print("[MACRO AGENT] Querying live global news & politics via Gemini...")
+    print("[MACRO AGENT] Querying and fact-checking live political/White House policies via Gemini...")
+    
     prompt = (
-        "Search the live web for breaking global news, geopolitical events, and major economic factors "
-        "over the last 24-48 hours that impact global stock markets. "
-        "Summarize the macro sentiment score from -1.0 (extremely bearish) to +1.0 (extremely bullish), "
-        "and provide a concise synthesis.\n\n"
+        "Search the live web for breaking political news, White House announcements, executive orders, "
+        "key political speeches, regulatory decisions, and government policy shifts over the last 24-48 hours.\n"
+        "CRITICAL INSTRUCTION: Fact-check every claim across multiple searches. Do not trust single-source rumors "
+        "or unverified social media chatter. Ensure the policy, speech, or directive is actively underway and verified.\n"
+        "Summarize the overall political/macro sentiment score from -1.0 (extremely hostile/bearish policy) "
+        "to +1.0 (extremely supportive/bullish policy), list the verified sources/headlines, and provide a strict reasoning synthesis.\n\n"
         "Respond strictly in JSON format with keys: 'macro_sentiment_score' (float), "
         "'verified_headlines' (list of strings), and 'summary_reasoning' (string)."
     )
+    
     try:
         response = gemini_client.models.generate_content(
             model="gemini-3.6-flash",
@@ -64,14 +68,14 @@ def fetch_and_verify_macro_news():
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
                 response_mime_type="application/json",
-                temperature=0.1
+                temperature=0.0
             )
         )
         data = json.loads(response.text)
-        print(f"[MACRO AGENT] Macro Sentiment Score: {data.get('macro_sentiment_score', 0.0)}")
+        print(f"[MACRO AGENT] Fact-Checked Political/Macro Sentiment Score: {data.get('macro_sentiment_score', 0.0)}")
         return data
     except Exception as e:
-        print(f"[WARNING] Failed to fetch macro news with Gemini (using neutral fallback): {e}")
+        print(f"[WARNING] Failed to fetch or fact-check political news with Gemini (using neutral fallback): {e}")
         return {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Fallback neutral sentiment."}
 
 # ==========================================
@@ -170,23 +174,28 @@ def deterministic_pre_screen(symbols):
     return candidates
 
 # ==========================================
-# 4. GROQ AI VETO AGENT
+# 4. GROQ AI VETO & VALIDATION AGENT
 # ==========================================
-def groq_ai_risk_veto(candidate, macro_score):
-    print(f"[GROQ RISK AGENT] Evaluating trade viability for {candidate['symbol']}...")
+def groq_ai_risk_veto(candidate, macro_data):
+    print(f"[GROQ RISK AGENT] Cross-auditing trade validity and macro claims for {candidate['symbol']}...")
+    
+    macro_score = macro_data.get("macro_sentiment_score", 0.0)
+    headlines = macro_data.get("verified_headlines", [])
     
     prompt = (
-        f"You are an elite risk management AI. Review the following trade candidate parameters:\n"
+        f"You are a strict, skeptical risk management AI controller. Your goal is capital preservation.\n"
+        f"Review the trade setup against the fact-checked political and macro data below:\n\n"
+        f"--- TRADE CANDIDATE ---\n"
         f"- Symbol: {candidate['symbol']}\n"
         f"- Current Price: {candidate['price']}\n"
         f"- Bullish Trend Confirmed: {candidate['bullish_trend']}\n"
         f"- Risk/Reward Ratio: {candidate['risk_reward_ratio']}\n"
         f"- Optimal Discount Zone: {candidate['is_discount']}\n"
-        f"- Fair Value Gap Respected: {candidate['fvg_respected']}\n"
+        f"- Fair Value Gap Respected: {candidate['fvg_respected']}\n\n"
+        f"--- FACT-CHECKED POLITICAL CONTEXT ---\n"
         f"- Macro Sentiment Score (-1 to 1): {macro_score}\n"
-        f"- Proposed Stop-Loss: {candidate['suggested_stop_loss']}\n"
-        f"- Proposed Take-Profit: {candidate['suggested_take_profit']}\n\n"
-        "Your job is to prevent dumb, high-risk trades. If market conditions look too choppy or risk is unfavorable, VETO it.\n"
+        f"- Verified Headlines/Policies: {json.dumps(headlines)}\n\n"
+        "Strictly evaluate if the political context or market environment contains any hidden traps, unverified hype, or hostile policies that invalidate this trade. If anything looks sketchy, overhyped, or unfavorable, VETO it.\n"
         "Respond strictly in JSON format with keys: 'approve' (boolean: true or false), and 'reasoning' (string)."
     )
     
@@ -194,7 +203,7 @@ def groq_ai_risk_veto(candidate, macro_score):
         completion = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a strict risk management trading bot controller. Output only valid JSON."},
+                {"role": "system", "content": "You are a skeptical, strict risk management auditor bot. Output only valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
@@ -210,9 +219,10 @@ def groq_ai_risk_veto(candidate, macro_score):
 # ==========================================
 # 5. EXECUTION & AUTOMATED EXIT ENGINE
 # ==========================================
-def execute_trades(candidates, macro_score):
+def execute_trades(candidates, macro_data):
+    macro_score = macro_data.get("macro_sentiment_score", 0.0)
     if macro_score < -0.2:
-        print(f"[EXECUTION] Macro sentiment score ({macro_score}) is too bearish. Skipping trade execution.")
+        print(f"[EXECUTION] Fact-checked political/macro sentiment score ({macro_score}) is too hostile/bearish. Skipping trade execution.")
         return
 
     try:
@@ -229,8 +239,7 @@ def execute_trades(candidates, macro_score):
     for candidate in candidates:
         if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.2:
             
-            # Run the candidate through Groq AI before letting it execute
-            is_approved_by_ai = groq_ai_risk_veto(candidate, macro_score)
+            is_approved_by_ai = groq_ai_risk_veto(candidate, macro_data)
             
             if not is_approved_by_ai:
                 print(f"[EXECUTION] Groq VETOED trade for {candidate['symbol']}. Skipping.")
@@ -243,7 +252,6 @@ def execute_trades(candidates, macro_score):
             print(f"[EXECUTION] Submitting protected bracket order for {symbol} (Notional: ${NOTIONAL_PER_TRADE}) | TP: {tp_price} | SL: {sl_price}")
             
             try:
-                # Alpaca Market Order with built-in Stop-Loss and Take-Profit exit brackets
                 order_data = MarketOrderRequest(
                     symbol=symbol,
                     notional=NOTIONAL_PER_TRADE,
@@ -262,18 +270,17 @@ def execute_trades(candidates, macro_score):
 # 6. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting hardened ICT/Groq AI autonomous trading cycle...")
+    print("Starting fact-checked, hardened Political-Macro & Groq AI autonomous trading cycle...")
     
     try:
         macro_data = fetch_and_verify_macro_news()
-        macro_score = macro_data.get("macro_sentiment_score", 0.0)
     except Exception:
-        macro_score = 0.0
+        macro_data = {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Error fallback."}
     
     try:
         ranked_watchlist = deterministic_pre_screen(SYMBOLS)
         print(f"[INFO] Watchlist pre-screened candidates: {ranked_watchlist}")
-        execute_trades(ranked_watchlist, macro_score)
+        execute_trades(ranked_watchlist, macro_data)
     except Exception as e:
         print(f"[WARNING] Cycle completed with warnings: {e}")
         
