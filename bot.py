@@ -79,7 +79,7 @@ def fetch_and_verify_macro_news():
         return {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Fallback neutral sentiment."}
 
 # ==========================================
-# 3. ICT / FVG & QUANT METRICS
+# 3. ICT / ADVANCED ORDER BLOCK, FVG & SMC ENGINE
 # ==========================================
 def get_market_data(symbol):
     try:
@@ -102,7 +102,7 @@ def get_market_data(symbol):
         print(f"[WARNING] Could not fetch market bars for {symbol}: {e}")
         return None
 
-def detect_fair_value_gaps_and_smc(df):
+def detect_order_blocks_and_smc(df):
     df['SMA_20'] = df['close'].rolling(window=20).mean()
     df['SMA_50'] = df['close'].rolling(window=50).mean()
     df['Swing_High'] = df['high'].rolling(window=5).max()
@@ -114,6 +114,7 @@ def detect_fair_value_gaps_and_smc(df):
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['ATR'] = ranges.max(axis=1).rolling(window=14).mean()
     
+    # Fair Value Gap (Imbalance) Detection
     bisi_list = [] 
     for i in range(2, len(df)):
         if df['low'].iloc[i] > df['high'].iloc[i-2]:
@@ -121,6 +122,28 @@ def detect_fair_value_gaps_and_smc(df):
             fvg_top = df['low'].iloc[i]
             ce = (fvg_top + fvg_bottom) / 2.0
             bisi_list.append({'index': i, 'bottom': fvg_bottom, 'top': fvg_top, 'ce': ce})
+
+    # Advanced Bullish Order Block Detection (Down-candle sequence before displacement + FVG + sweep)
+    valid_ob = None
+    for i in range(5, len(df) - 1):
+        is_down_candle = df['close'].iloc[i] < df['open'].iloc[i]
+        next_is_strong_up = (df['close'].iloc[i+1] > df['open'].iloc[i+1]) and ((df['close'].iloc[i+1] - df['open'].iloc[i+1]) > df['ATR'].iloc[i+1])
+        swept_liquidity = df['low'].iloc[i] <= df['Swing_Low'].iloc[i]
+        has_imbalance = any(b['index'] >= i for b in bisi_list)
+
+        if is_down_candle and next_is_strong_up and swept_liquidity and has_imbalance:
+            ob_open = df['open'].iloc[i]
+            ob_close = df['close'].iloc[i]
+            body_low = min(ob_open, ob_close)
+            body_high = max(ob_open, ob_close)
+            mean_threshold = (body_low + body_high) / 2.0
+            
+            valid_ob = {
+                "index": i,
+                "entry_price": ob_open,
+                "mean_threshold": mean_threshold,
+                "stop_loss": body_low - (df['ATR'].iloc[i] * 0.5)
+            }
 
     recent_high = df['high'].rolling(window=50).max().iloc[-1]
     recent_low = df['low'].rolling(window=50).min().iloc[-1]
@@ -138,7 +161,7 @@ def detect_fair_value_gaps_and_smc(df):
     df['Calculated_RR'] = rr_ratio
     latest_bisi = bisi_list[-1] if bisi_list else None
     
-    return df, latest_bisi, is_in_discount, atr, swing_low
+    return df, latest_bisi, valid_ob, is_in_discount, atr, swing_low
 
 def deterministic_pre_screen(symbols):
     candidates = []
@@ -146,7 +169,7 @@ def deterministic_pre_screen(symbols):
         try:
             df = get_market_data(symbol)
             if df is not None and len(df) > 50:
-                df, bisi, is_discount, atr, swing_low = detect_fair_value_gaps_and_smc(df)
+                df, bisi, valid_ob, is_discount, atr, swing_low = detect_order_blocks_and_smc(df)
                 current_price = df['close'].iloc[-1]
                 sma_20 = df['SMA_20'].iloc[-1]
                 sma_50 = df['SMA_50'].iloc[-1]
@@ -156,6 +179,11 @@ def deterministic_pre_screen(symbols):
                 if bisi and current_price >= bisi['ce']:
                     fvg_respected = True
 
+                ob_respected = False
+                if valid_ob:
+                    if current_price >= valid_ob['mean_threshold']:
+                        ob_respected = True
+
                 candidates.append({
                     "symbol": symbol,
                     "price": round(current_price, 2),
@@ -163,39 +191,86 @@ def deterministic_pre_screen(symbols):
                     "bullish_trend": is_bullish_trend,
                     "is_discount": is_discount,
                     "fvg_respected": fvg_respected,
+                    "order_block_detected": valid_ob is not None,
+                    "order_block_respected": ob_respected,
                     "atr": round(atr, 2),
-                    "suggested_stop_loss": round(current_price - (atr * 1.5), 2),
+                    "suggested_stop_loss": round(valid_ob['stop_loss'] if valid_ob else current_price - (atr * 1.5), 2),
                     "suggested_take_profit": round(current_price + (atr * 3.0), 2)
                 })
         except Exception as e:
             print(f"[WARNING] Skipping symbol {symbol} due to calculation error: {e}")
             
-    candidates.sort(key=lambda x: (x['risk_reward_ratio'], x['fvg_respected']), reverse=True)
+    candidates.sort(key=lambda x: (x['risk_reward_ratio'], x['order_block_respected'], x['fvg_respected']), reverse=True)
     return candidates
 
 # ==========================================
-# 4. GROQ AI VETO & VALIDATION AGENT
+# 4. ACTIVE POSITION MANAGER & EARLY EXIT ENGINE
+# ==========================================
+def manage_open_positions():
+    print("[POSITION MANAGER] Checking active positions for proactive risk management & early exits...")
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as e:
+        print(f"[WARNING] Could not fetch positions for management: {e}")
+        return
+
+    for p in positions:
+        symbol = p.symbol
+        current_price = float(p.current_price)
+        avg_entry = float(p.avg_entry_price)
+        unrealized_plpc = float(p.unrealized_plpc)
+        
+        print(f"[POSITION MANAGER] Evaluating open position {symbol} | Entry: {avg_entry} | Current: {current_price} | P&L: {unrealized_plpc*100:.2f}%")
+        
+        df = get_market_data(symbol)
+        if df is not None and len(df) > 50:
+            df, bisi, valid_ob, is_discount, atr, swing_low = detect_order_blocks_and_smc(df)
+            
+            mean_threshold_broken = valid_ob and (current_price < valid_ob['mean_threshold'])
+            trend_lost = current_price < df['SMA_20'].iloc[-1]
+            
+            # Secure minor profits early if structure breaks
+            if unrealized_plpc > 0.005 and (mean_threshold_broken or trend_lost):
+                print(f"[EARLY EXIT] Securing profits on {symbol} due to structural breakdown. Closing position.")
+                try:
+                    trading_client.close_position(symbol_or_asset_id=symbol)
+                    print(f"[SUCCESS] Successfully closed {symbol} early to lock in gains.")
+                except Exception as e:
+                    print(f"[ERROR] Failed to close position for {symbol}: {e}")
+            
+            # Cut losses early if order block mean threshold fails before reaching bottom stop-loss
+            elif mean_threshold_broken and unrealized_plpc < -0.005:
+                print(f"[EARLY EXIT] Cutting losses early on {symbol} as order block mean threshold failed.")
+                try:
+                    trading_client.close_position(symbol_or_asset_id=symbol)
+                    print(f"[SUCCESS] Successfully cut {symbol} early.")
+                except Exception as e:
+                    print(f"[ERROR] Failed to close position for {symbol}: {e}")
+
+# ==========================================
+# 5. GROQ AI VETO & VALIDATION AGENT
 # ==========================================
 def groq_ai_risk_veto(candidate, macro_data):
-    print(f"[GROQ RISK AGENT] Cross-auditing trade validity and macro claims for {candidate['symbol']}...")
+    print(f"[GROQ RISK AGENT] Cross-auditing trade validity, order block structure, and macro claims for {candidate['symbol']}...")
     
     macro_score = macro_data.get("macro_sentiment_score", 0.0)
     headlines = macro_data.get("verified_headlines", [])
     
     prompt = (
         f"You are a strict, skeptical risk management AI controller. Your goal is capital preservation.\n"
-        f"Review the trade setup against the fact-checked political and macro data below:\n\n"
+        f"Review the trade setup against the advanced Order Block & Fair Value Gap parameters and fact-checked macro data below:\n\n"
         f"--- TRADE CANDIDATE ---\n"
         f"- Symbol: {candidate['symbol']}\n"
         f"- Current Price: {candidate['price']}\n"
         f"- Bullish Trend Confirmed: {candidate['bullish_trend']}\n"
         f"- Risk/Reward Ratio: {candidate['risk_reward_ratio']}\n"
         f"- Optimal Discount Zone: {candidate['is_discount']}\n"
-        f"- Fair Value Gap Respected: {candidate['fvg_respected']}\n\n"
+        f"- Fair Value Gap Imbalance Present: {candidate['fvg_respected']}\n"
+        f"- Valid Order Block Detected & Respected (Mean Threshold Held): {candidate['order_block_respected']}\n\n"
         f"--- FACT-CHECKED POLITICAL CONTEXT ---\n"
         f"- Macro Sentiment Score (-1 to 1): {macro_score}\n"
         f"- Verified Headlines/Policies: {json.dumps(headlines)}\n\n"
-        "Strictly evaluate if the political context or market environment contains any hidden traps, unverified hype, or hostile policies that invalidate this trade. If anything looks sketchy, overhyped, or unfavorable, VETO it.\n"
+        "Strictly evaluate if the order block structure, institutional delivery shift, and political context support this entry. If the order block is violated, unverified, or risk is unfavorable, VETO it.\n"
         "Respond strictly in JSON format with keys: 'approve' (boolean: true or false), and 'reasoning' (string)."
     )
     
@@ -217,7 +292,7 @@ def groq_ai_risk_veto(candidate, macro_data):
         return False
 
 # ==========================================
-# 5. EXECUTION & AUTOMATED EXIT ENGINE
+# 6. EXECUTION & NEW TRADES ENGINE
 # ==========================================
 def execute_trades(candidates, macro_data):
     macro_score = macro_data.get("macro_sentiment_score", 0.0)
@@ -227,7 +302,7 @@ def execute_trades(candidates, macro_data):
 
     try:
         positions = trading_client.get_all_positions()
-        print(f"[EXECUTION] Current open positions: {len(positions)}")
+        print(f"[EXECUTION] Current open positions count: {len(positions)}")
     except Exception as e:
         print(f"[WARNING] Could not fetch open positions: {e}")
         positions = []
@@ -237,7 +312,7 @@ def execute_trades(candidates, macro_data):
         return
 
     for candidate in candidates:
-        if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.2:
+        if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.2 and candidate['order_block_detected']:
             
             is_approved_by_ai = groq_ai_risk_veto(candidate, macro_data)
             
@@ -249,7 +324,7 @@ def execute_trades(candidates, macro_data):
             sl_price = candidate['suggested_stop_loss']
             tp_price = candidate['suggested_take_profit']
             
-            print(f"[EXECUTION] Submitting protected bracket order for {symbol} (Notional: ${NOTIONAL_PER_TRADE}) | TP: {tp_price} | SL: {sl_price}")
+            print(f"[EXECUTION] Submitting protected order block bracket for {symbol} (Notional: ${NOTIONAL_PER_TRADE}) | TP: {tp_price} | SL: {sl_price}")
             
             try:
                 order_data = MarketOrderRequest(
@@ -267,16 +342,24 @@ def execute_trades(candidates, macro_data):
                 print(f"[ERROR] Failed to execute order for {symbol}: {e}")
 
 # ==========================================
-# 6. MAIN CONTROLLER LOOP
+# 7. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting fact-checked, hardened Political-Macro & Groq AI autonomous trading cycle...")
+    print("Starting active-management Order Block & Macro trading cycle...")
     
+    # Step 1: Manage and protect existing open positions first (Active Management)
+    try:
+        manage_open_positions()
+    except Exception as e:
+        print(f"[WARNING] Position management encountered an error: {e}")
+    
+    # Step 2: Fetch fact-checked political/macro news via Gemini
     try:
         macro_data = fetch_and_verify_macro_news()
     except Exception:
         macro_data = {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Error fallback."}
     
+    # Step 3: Pre-screen watchlist, run Groq Veto, and look for new trades
     try:
         ranked_watchlist = deterministic_pre_screen(SYMBOLS)
         print(f"[INFO] Watchlist pre-screened candidates: {ranked_watchlist}")
