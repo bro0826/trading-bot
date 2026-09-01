@@ -123,7 +123,7 @@ def detect_order_blocks_and_smc(df):
             ce = (fvg_top + fvg_bottom) / 2.0
             bisi_list.append({'index': i, 'bottom': fvg_bottom, 'top': fvg_top, 'ce': ce})
 
-    # Advanced Bullish Order Block Detection (Down-candle sequence before displacement + FVG + sweep)
+    # Advanced Bullish Order Block Detection
     valid_ob = None
     for i in range(5, len(df) - 1):
         is_down_candle = df['close'].iloc[i] < df['open'].iloc[i]
@@ -171,6 +171,11 @@ def deterministic_pre_screen(symbols):
             if df is not None and len(df) > 50:
                 df, bisi, valid_ob, is_discount, atr, swing_low = detect_order_blocks_and_smc(df)
                 current_price = df['close'].iloc[-1]
+                current_open = df['open'].iloc[-1]
+                
+                # FIX: Require intraday bullish momentum (price > open) to avoid buying a fading candle
+                intraday_momentum_positive = current_price >= current_open
+                
                 sma_20 = df['SMA_20'].iloc[-1]
                 sma_50 = df['SMA_50'].iloc[-1]
                 is_bullish_trend = (current_price > sma_20) and (sma_20 > sma_50)
@@ -189,6 +194,7 @@ def deterministic_pre_screen(symbols):
                     "price": round(current_price, 2),
                     "risk_reward_ratio": round(df['Calculated_RR'].iloc[-1], 2),
                     "bullish_trend": is_bullish_trend,
+                    "intraday_momentum_positive": intraday_momentum_positive,
                     "is_discount": is_discount,
                     "fvg_respected": fvg_respected,
                     "order_block_detected": valid_ob is not None,
@@ -229,7 +235,6 @@ def manage_open_positions():
             mean_threshold_broken = valid_ob and (current_price < valid_ob['mean_threshold'])
             trend_lost = current_price < df['SMA_20'].iloc[-1]
             
-            # Secure minor profits early if structure breaks
             if unrealized_plpc > 0.005 and (mean_threshold_broken or trend_lost):
                 print(f"[EARLY EXIT] Securing profits on {symbol} due to structural breakdown. Closing position.")
                 try:
@@ -238,7 +243,6 @@ def manage_open_positions():
                 except Exception as e:
                     print(f"[ERROR] Failed to close position for {symbol}: {e}")
             
-            # Cut losses early if order block mean threshold fails before reaching bottom stop-loss
             elif mean_threshold_broken and unrealized_plpc < -0.005:
                 print(f"[EARLY EXIT] Cutting losses early on {symbol} as order block mean threshold failed.")
                 try:
@@ -263,6 +267,7 @@ def groq_ai_risk_veto(candidate, macro_data):
         f"- Symbol: {candidate['symbol']}\n"
         f"- Current Price: {candidate['price']}\n"
         f"- Bullish Trend Confirmed: {candidate['bullish_trend']}\n"
+        f"- Intraday Momentum Positive (Price >= Open): {candidate['intraday_momentum_positive']}\n"
         f"- Risk/Reward Ratio: {candidate['risk_reward_ratio']}\n"
         f"- Optimal Discount Zone: {candidate['is_discount']}\n"
         f"- Fair Value Gap Imbalance Present: {candidate['fvg_respected']}\n"
@@ -270,7 +275,7 @@ def groq_ai_risk_veto(candidate, macro_data):
         f"--- FACT-CHECKED POLITICAL CONTEXT ---\n"
         f"- Macro Sentiment Score (-1 to 1): {macro_score}\n"
         f"- Verified Headlines/Policies: {json.dumps(headlines)}\n\n"
-        "Strictly evaluate if the order block structure, institutional delivery shift, and political context support this entry. If the order block is violated, unverified, or risk is unfavorable, VETO it.\n"
+        "Strictly evaluate if the order block structure, institutional delivery shift, and political context support this entry. If intraday momentum is negative or the order block is violated, VETO it.\n"
         "Respond strictly in JSON format with keys: 'approve' (boolean: true or false), and 'reasoning' (string)."
     )
     
@@ -312,7 +317,8 @@ def execute_trades(candidates, macro_data):
         return
 
     for candidate in candidates:
-        if candidate['bullish_trend'] and candidate['risk_reward_ratio'] > 1.2 and candidate['order_block_detected']:
+        # FIX: Added strict check for positive intraday momentum before execution
+        if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] > 1.2 and candidate['order_block_detected']:
             
             is_approved_by_ai = groq_ai_risk_veto(candidate, macro_data)
             
@@ -347,19 +353,16 @@ def execute_trades(candidates, macro_data):
 if __name__ == "__main__":
     print("Starting active-management Order Block & Macro trading cycle...")
     
-    # Step 1: Manage and protect existing open positions first (Active Management)
     try:
         manage_open_positions()
     except Exception as e:
         print(f"[WARNING] Position management encountered an error: {e}")
     
-    # Step 2: Fetch fact-checked political/macro news via Gemini
     try:
         macro_data = fetch_and_verify_macro_news()
     except Exception:
         macro_data = {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Error fallback."}
     
-    # Step 3: Pre-screen watchlist, run Groq Veto, and look for new trades
     try:
         ranked_watchlist = deterministic_pre_screen(SYMBOLS)
         print(f"[INFO] Watchlist pre-screened candidates: {ranked_watchlist}")
