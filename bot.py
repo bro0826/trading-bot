@@ -45,7 +45,51 @@ SYMBOLS = ["QQQ", "AAPL", "NVDA", "MSFT", "META", "GOOGL"]
 NOTIONAL_PER_TRADE = 1000.0
 
 # ==========================================
-# 2. FACT-CHECKED POLITICAL & MACRO ENGINE
+# 2. AUTOMATED REGIME FILTER (RED LIGHT / GREEN LIGHT)
+# ==========================================
+def market_regime_is_safe():
+    print("[REGIME FILTER] Evaluating market structure and trend strength on QQQ...")
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=60)
+        request_params = StockBarsRequest(
+            symbol_or_symbols="QQQ",
+            timeframe=TimeFrame.Day,
+            start=start_date,
+            end=end_date
+        )
+        bars = data_client.get_stock_bars(request_params)
+        df = bars.df
+        if df is None or df.empty:
+            print("[WARNING] Could not fetch QQQ bars for regime check. Defaulting to RED LIGHT for safety.")
+            return False
+            
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index(level=0, drop=True)
+            
+        df['SMA_20'] = df['close'].rolling(window=20).mean()
+        df['SMA_50'] = df['close'].rolling(window=50).mean()
+        
+        current_price = df['close'].iloc[-1]
+        sma_20 = df['SMA_20'].iloc[-1]
+        sma_50 = df['SMA_50'].iloc[-1]
+        
+        # Check percentage spread between 20 SMA and 50 SMA to measure compression/choppiness
+        spread = abs(sma_20 - sma_50) / current_price
+        
+        # If moving averages are tightly compressed, market is sideways noise
+        if spread < 0.006:
+            print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Choppy sideways regime detected. Halting bot.")
+            return False
+            
+        print(f"[REGIME FILTER] 🟢 GREEN LIGHT: Trend structure is wide enough (Spread: {spread:.4f}). Proceeding.")
+        return True
+    except Exception as e:
+        print(f"[WARNING] Regime filter error: {e}. Defaulting to RED LIGHT.")
+        return False
+
+# ==========================================
+# 3. FACT-CHECKED POLITICAL & MACRO ENGINE
 # ==========================================
 def fetch_and_verify_macro_news():
     print("[MACRO AGENT] Querying and fact-checking live political/White House policies via Gemini...")
@@ -79,7 +123,7 @@ def fetch_and_verify_macro_news():
         return {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Fallback neutral sentiment."}
 
 # ==========================================
-# 3. ICT / ADVANCED ORDER BLOCK, FVG & SMC ENGINE
+# 4. ICT / ADVANCED ORDER BLOCK, FVG & SMC ENGINE
 # ==========================================
 def get_market_data(symbol):
     try:
@@ -114,7 +158,6 @@ def detect_order_blocks_and_smc(df):
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['ATR'] = ranges.max(axis=1).rolling(window=14).mean()
     
-    # Fair Value Gap (Imbalance) Detection
     bisi_list = [] 
     for i in range(2, len(df)):
         if df['low'].iloc[i] > df['high'].iloc[i-2]:
@@ -123,7 +166,6 @@ def detect_order_blocks_and_smc(df):
             ce = (fvg_top + fvg_bottom) / 2.0
             bisi_list.append({'index': i, 'bottom': fvg_bottom, 'top': fvg_top, 'ce': ce})
 
-    # Advanced Bullish Order Block Detection
     valid_ob = None
     for i in range(5, len(df) - 1):
         is_down_candle = df['close'].iloc[i] < df['open'].iloc[i]
@@ -173,7 +215,6 @@ def deterministic_pre_screen(symbols):
                 current_price = df['close'].iloc[-1]
                 current_open = df['open'].iloc[-1]
                 
-                # FIX: Require intraday bullish momentum (price > open) to avoid buying a fading candle
                 intraday_momentum_positive = current_price >= current_open
                 
                 sma_20 = df['SMA_20'].iloc[-1]
@@ -210,7 +251,7 @@ def deterministic_pre_screen(symbols):
     return candidates
 
 # ==========================================
-# 4. ACTIVE POSITION MANAGER & EARLY EXIT ENGINE
+# 5. ACTIVE POSITION MANAGER & EARLY EXIT ENGINE
 # ==========================================
 def manage_open_positions():
     print("[POSITION MANAGER] Checking active positions for proactive risk management & early exits...")
@@ -252,7 +293,7 @@ def manage_open_positions():
                     print(f"[ERROR] Failed to close position for {symbol}: {e}")
 
 # ==========================================
-# 5. GROQ AI VETO & VALIDATION AGENT
+# 6. GROQ AI VETO & VALIDATION AGENT
 # ==========================================
 def groq_ai_risk_veto(candidate, macro_data):
     print(f"[GROQ RISK AGENT] Cross-auditing trade validity, order block structure, and macro claims for {candidate['symbol']}...")
@@ -297,7 +338,7 @@ def groq_ai_risk_veto(candidate, macro_data):
         return False
 
 # ==========================================
-# 6. EXECUTION & NEW TRADES ENGINE
+# 7. EXECUTION & NEW TRADES ENGINE
 # ==========================================
 def execute_trades(candidates, macro_data):
     macro_score = macro_data.get("macro_sentiment_score", 0.0)
@@ -317,7 +358,6 @@ def execute_trades(candidates, macro_data):
         return
 
     for candidate in candidates:
-        # FIX: Added strict check for positive intraday momentum before execution
         if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] > 1.2 and candidate['order_block_detected']:
             
             is_approved_by_ai = groq_ai_risk_veto(candidate, macro_data)
@@ -348,11 +388,16 @@ def execute_trades(candidates, macro_data):
                 print(f"[ERROR] Failed to execute order for {symbol}: {e}")
 
 # ==========================================
-# 7. MAIN CONTROLLER LOOP
+# 8. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting active-management Order Block & Macro trading cycle...")
+    print("Starting automated-management Order Block & Macro trading cycle...")
     
+    # 1. Automated Regime Filter: Check if market environment is safe before doing anything
+    if not market_regime_is_safe():
+        print("[TERMINATION] Red light active. Script exiting safely with zero orders placed.")
+        sys.exit(0)
+        
     try:
         manage_open_positions()
     except Exception as e:
