@@ -26,7 +26,8 @@ try:
     trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
     data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 except Exception as e:
-    print(f"[WARNING] Alpaca client init warning: {e}")
+    print(f"[CRITICAL ERROR] Alpaca client initialization failed: {e}")
+    sys.exit(1)
 
 try:
     groq_client = OpenAI(
@@ -34,21 +35,23 @@ try:
         api_key=GROQ_API_KEY
     )
 except Exception as e:
-    print(f"[WARNING] Groq client init warning: {e}")
+    print(f"[CRITICAL ERROR] Groq client initialization failed: {e}")
+    sys.exit(1)
 
 try:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
-    print(f"[WARNING] Gemini client init warning: {e}")
+    print(f"[CRITICAL ERROR] Gemini client initialization failed: {e}")
+    sys.exit(1)
 
 SYMBOLS = ["QQQ", "AAPL", "NVDA", "MSFT", "META", "GOOGL"]
 NOTIONAL_PER_TRADE = 1000.0
 
 # ==========================================
-# 2. AUTOMATED REGIME FILTER (RED LIGHT / GREEN LIGHT)
+# 2. AUTOMATED REGIME & VOLATILITY FILTER
 # ==========================================
 def market_regime_is_safe():
-    print("[REGIME FILTER] Evaluating market structure and trend strength on QQQ...")
+    print("[REGIME FILTER] Evaluating market structure and trend volatility on QQQ...")
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=60)
@@ -61,7 +64,7 @@ def market_regime_is_safe():
         bars = data_client.get_stock_bars(request_params)
         df = bars.df
         if df is None or df.empty:
-            print("[WARNING] Could not fetch QQQ bars for regime check. Defaulting to RED LIGHT for safety.")
+            print("[WARNING] Could not fetch QQQ bars. Triggering emergency RED LIGHT.")
             return False
             
         if isinstance(df.index, pd.MultiIndex):
@@ -74,40 +77,37 @@ def market_regime_is_safe():
         sma_20 = df['SMA_20'].iloc[-1]
         sma_50 = df['SMA_50'].iloc[-1]
         
-        # Check percentage spread between 20 SMA and 50 SMA to measure compression/choppiness
         spread = abs(sma_20 - sma_50) / current_price
         
-        # If moving averages are tightly compressed, market is sideways noise
-        if spread < 0.006:
-            print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Choppy sideways regime detected. Halting bot.")
+        # Hard check for compressed, choppy sideways chop
+        if spread < 0.005:
+            print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Halting execution.")
             return False
             
-        print(f"[REGIME FILTER] 🟢 GREEN LIGHT: Trend structure is wide enough (Spread: {spread:.4f}). Proceeding.")
+        print(f"[REGIME FILTER] 🟢 GREEN LIGHT: Trend structure is stable (Spread: {spread:.4f}).")
         return True
     except Exception as e:
-        print(f"[WARNING] Regime filter error: {e}. Defaulting to RED LIGHT.")
+        print(f"[WARNING] Regime filter exception: {e}. Defaulting to RED LIGHT.")
         return False
 
 # ==========================================
-# 3. FACT-CHECKED POLITICAL & MACRO ENGINE
+# 3. LIVE WEB-SEARCH MACRO & YIELD AUDITOR
 # ==========================================
 def fetch_and_verify_macro_news():
-    print("[MACRO AGENT] Querying and fact-checking live political/White House policies via Gemini...")
+    print("[MACRO AGENT] Querying live financial news, Treasury yields, and geopolitical risk via Gemini Web Search...")
     
     prompt = (
-        "Search the live web for breaking political news, White House announcements, executive orders, "
-        "key political speeches, regulatory decisions, and government policy shifts over the last 24-48 hours.\n"
-        "CRITICAL INSTRUCTION: Fact-check every claim across multiple searches. Do not trust single-source rumors "
-        "or unverified social media chatter. Ensure the policy, speech, or directive is actively underway and verified.\n"
-        "Summarize the overall political/macro sentiment score from -1.0 (extremely hostile/bearish policy) "
-        "to +1.0 (extremely supportive/bullish policy), list the verified sources/headlines, and provide a strict reasoning synthesis.\n\n"
+        "Search the live web right now for current U.S. Treasury 10-year yields, Federal Reserve statements, "
+        "crude oil price movements, and major market risk factors over the last 24 hours.\n"
+        "Evaluate whether macro market conditions are safe for long equity momentum strategies or if there is a severe risk-off panic.\n"
+        "Calculate a macro sentiment score from -1.0 (extreme risk-off crash/high yield panic) to +1.0 (strong risk-on/bullish).\n"
         "Respond strictly in JSON format with keys: 'macro_sentiment_score' (float), "
         "'verified_headlines' (list of strings), and 'summary_reasoning' (string)."
     )
     
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -116,14 +116,20 @@ def fetch_and_verify_macro_news():
             )
         )
         data = json.loads(response.text)
-        print(f"[MACRO AGENT] Fact-Checked Political/Macro Sentiment Score: {data.get('macro_sentiment_score', 0.0)}")
+        score = float(data.get('macro_sentiment_score', -1.0)) # Default to hostile if unreadable
+        print(f"[MACRO AGENT] Live Web Macro Sentiment Score: {score}")
+        print(f"[MACRO AGENT] Reasoning: {data.get('summary_reasoning')}")
         return data
     except Exception as e:
-        print(f"[WARNING] Failed to fetch or fact-check political news with Gemini (using neutral fallback): {e}")
-        return {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Fallback neutral sentiment."}
+        print(f"[CRITICAL SAFETY WARNING] Live macro web search failed: {e}. Defaulting to HOSTILE macro score (-1.0) to prevent losses.")
+        return {
+            "macro_sentiment_score": -1.0, 
+            "verified_headlines": ["API Error / Search Failure"], 
+            "summary_reasoning": "Forced fail-safe due to search failure."
+        }
 
 # ==========================================
-# 4. ICT / ADVANCED ORDER BLOCK, FVG & SMC ENGINE
+# 4. ICT / ORDER BLOCK & SMC ENGINE
 # ==========================================
 def get_market_data(symbol):
     try:
@@ -245,175 +251,144 @@ def deterministic_pre_screen(symbols):
                     "suggested_take_profit": round(current_price + (atr * 3.0), 2)
                 })
         except Exception as e:
-            print(f"[WARNING] Skipping symbol {symbol} due to calculation error: {e}")
+            print(f"[WARNING] Skipping symbol {symbol}: {e}")
             
     candidates.sort(key=lambda x: (x['risk_reward_ratio'], x['order_block_respected'], x['fvg_respected']), reverse=True)
     return candidates
 
 # ==========================================
-# 5. ACTIVE POSITION MANAGER & EARLY EXIT ENGINE
+# 5. ACTIVE POSITION RISK MANAGER
 # ==========================================
 def manage_open_positions():
-    print("[POSITION MANAGER] Checking active positions for proactive risk management & early exits...")
+    print("[POSITION MANAGER] Evaluating active positions for early risk exits...")
     try:
         positions = trading_client.get_all_positions()
     except Exception as e:
-        print(f"[WARNING] Could not fetch positions for management: {e}")
+        print(f"[WARNING] Could not fetch positions: {e}")
         return
 
     for p in positions:
         symbol = p.symbol
         current_price = float(p.current_price)
-        avg_entry = float(p.avg_entry_price)
         unrealized_plpc = float(p.unrealized_plpc)
-        
-        print(f"[POSITION MANAGER] Evaluating open position {symbol} | Entry: {avg_entry} | Current: {current_price} | P&L: {unrealized_plpc*100:.2f}%")
         
         df = get_market_data(symbol)
         if df is not None and len(df) > 50:
             df, bisi, valid_ob, is_discount, atr, swing_low = detect_order_blocks_and_smc(df)
-            
-            mean_threshold_broken = valid_ob and (current_price < valid_ob['mean_threshold'])
             trend_lost = current_price < df['SMA_20'].iloc[-1]
             
-            if unrealized_plpc > 0.005 and (mean_threshold_broken or trend_lost):
-                print(f"[EARLY EXIT] Securing profits on {symbol} due to structural breakdown. Closing position.")
+            if trend_lost or unrealized_plpc < -0.01:
+                print(f"[EMERGENCY EXIT] Cutting losses on {symbol} due to trend failure or drawdown limit.")
                 try:
                     trading_client.close_position(symbol_or_asset_id=symbol)
-                    print(f"[SUCCESS] Successfully closed {symbol} early to lock in gains.")
                 except Exception as e:
-                    print(f"[ERROR] Failed to close position for {symbol}: {e}")
-            
-            elif mean_threshold_broken and unrealized_plpc < -0.005:
-                print(f"[EARLY EXIT] Cutting losses early on {symbol} as order block mean threshold failed.")
-                try:
-                    trading_client.close_position(symbol_or_asset_id=symbol)
-                    print(f"[SUCCESS] Successfully cut {symbol} early.")
-                except Exception as e:
-                    print(f"[ERROR] Failed to close position for {symbol}: {e}")
+                    print(f"[ERROR] Failed to close position {symbol}: {e}")
 
 # ==========================================
-# 6. GROQ AI VETO & VALIDATION AGENT
+# 6. GROQ AI RISK AUDITOR
 # ==========================================
 def groq_ai_risk_veto(candidate, macro_data):
-    print(f"[GROQ RISK AGENT] Cross-auditing trade validity, order block structure, and macro claims for {candidate['symbol']}...")
+    print(f"[GROQ RISK AGENT] Auditing {candidate['symbol']} setup...")
     
-    macro_score = macro_data.get("macro_sentiment_score", 0.0)
+    macro_score = macro_data.get("macro_sentiment_score", -1.0)
     headlines = macro_data.get("verified_headlines", [])
     
     prompt = (
-        f"You are a strict, skeptical risk management AI controller. Your goal is capital preservation.\n"
-        f"Review the trade setup against the advanced Order Block & Fair Value Gap parameters and fact-checked macro data below:\n\n"
-        f"--- TRADE CANDIDATE ---\n"
+        f"You are an ultra-conservative risk management AI controller. Capital preservation is your only directive.\n"
+        f"Evaluate this trade setup against live web-scraped macro data:\n\n"
         f"- Symbol: {candidate['symbol']}\n"
-        f"- Current Price: {candidate['price']}\n"
-        f"- Bullish Trend Confirmed: {candidate['bullish_trend']}\n"
-        f"- Intraday Momentum Positive (Price >= Open): {candidate['intraday_momentum_positive']}\n"
+        f"- Bullish Trend: {candidate['bullish_trend']}\n"
+        f"- Intraday Momentum Positive: {candidate['intraday_momentum_positive']}\n"
         f"- Risk/Reward Ratio: {candidate['risk_reward_ratio']}\n"
-        f"- Optimal Discount Zone: {candidate['is_discount']}\n"
-        f"- Fair Value Gap Imbalance Present: {candidate['fvg_respected']}\n"
-        f"- Valid Order Block Detected & Respected (Mean Threshold Held): {candidate['order_block_respected']}\n\n"
-        f"--- FACT-CHECKED POLITICAL CONTEXT ---\n"
-        f"- Macro Sentiment Score (-1 to 1): {macro_score}\n"
-        f"- Verified Headlines/Policies: {json.dumps(headlines)}\n\n"
-        "Strictly evaluate if the order block structure, institutional delivery shift, and political context support this entry. If intraday momentum is negative or the order block is violated, VETO it.\n"
-        "Respond strictly in JSON format with keys: 'approve' (boolean: true or false), and 'reasoning' (string)."
+        f"- Order Block Respected: {candidate['order_block_respected']}\n"
+        f"- Live Macro Sentiment Score (-1 to 1): {macro_score}\n"
+        f"- Recent Headlines: {json.dumps(headlines)}\n\n"
+        "If macro conditions show high yields, panic, or negative sentiment, VETO immediately.\n"
+        "Respond strictly in JSON format with keys: 'approve' (boolean), and 'reasoning' (string)."
     )
     
     try:
         completion = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a skeptical, strict risk management auditor bot. Output only valid JSON."},
+                {"role": "system", "content": "You are a skeptical risk auditor. Output only valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
             temperature=0.0
         )
         result = json.loads(completion.choices[0].message.content)
-        print(f"[GROQ RISK AGENT] Decision for {candidate['symbol']} -> Approve: {result.get('approve')} | Reason: {result.get('reasoning')}")
         return result.get('approve', False)
     except Exception as e:
-        print(f"[WARNING] Groq API call failed, defaulting to veto for safety: {e}")
+        print(f"[WARNING] Groq audit failed, defaulting to veto: {e}")
         return False
 
 # ==========================================
-# 7. EXECUTION & NEW TRADES ENGINE
+# 7. EXECUTION ENGINE
 # ==========================================
 def execute_trades(candidates, macro_data):
-    macro_score = macro_data.get("macro_sentiment_score", 0.0)
-    if macro_score < -0.2:
-        print(f"[EXECUTION] Fact-checked political/macro sentiment score ({macro_score}) is too hostile/bearish. Skipping trade execution.")
+    macro_score = macro_data.get("macro_sentiment_score", -1.0)
+    
+    # HARD MACRO CIRCUIT BREAKER: Refuse all trades if macro score is below 0.0
+    if macro_score < 0.0:
+        print(f"[CIRCUIT BREAKER] 🔴 MACRO LOCKOUT ACTIVE: Sentiment score ({macro_score}) indicates hostile conditions. Zero orders allowed.")
         return
 
     try:
         positions = trading_client.get_all_positions()
-        print(f"[EXECUTION] Current open positions count: {len(positions)}")
-    except Exception as e:
-        print(f"[WARNING] Could not fetch open positions: {e}")
+    except Exception:
         positions = []
 
-    if len(positions) >= 3:
-        print("[EXECUTION] Max position limit reached. Skipping new orders.")
+    if len(positions) >= 2:
+        print("[EXECUTION] Position limit reached. Skipping.")
         return
 
     for candidate in candidates:
-        if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] > 1.2 and candidate['order_block_detected']:
+        if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] > 1.3 and candidate['order_block_detected']:
             
-            is_approved_by_ai = groq_ai_risk_veto(candidate, macro_data)
-            
-            if not is_approved_by_ai:
-                print(f"[EXECUTION] Groq VETOED trade for {candidate['symbol']}. Skipping.")
+            if not groq_ai_risk_veto(candidate, macro_data):
+                print(f"[EXECUTION] Trade VETOED for {candidate['symbol']}.")
                 continue
 
             symbol = candidate['symbol']
-            sl_price = candidate['suggested_stop_loss']
-            tp_price = candidate['suggested_take_profit']
-            
-            print(f"[EXECUTION] Submitting protected order block bracket for {symbol} (Notional: ${NOTIONAL_PER_TRADE}) | TP: {tp_price} | SL: {sl_price}")
-            
             try:
                 order_data = MarketOrderRequest(
                     symbol=symbol,
                     notional=NOTIONAL_PER_TRADE,
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
-                    take_profit=TakeProfitRequest(limit_price=tp_price),
-                    stop_loss=StopLossRequest(stop_price=sl_price)
+                    take_profit=TakeProfitRequest(limit_price=candidate['suggested_take_profit']),
+                    stop_loss=StopLossRequest(stop_press=candidate['suggested_stop_loss']) if 'suggested_stop_loss' in candidate else None
                 )
                 order = trading_client.submit_order(order_data=order_data)
-                print(f"[SUCCESS] Protected order placed for {symbol}: {order.id}")
+                print(f"[SUCCESS] Protected order submitted for {symbol}: {order.id}")
                 break 
             except Exception as e:
-                print(f"[ERROR] Failed to execute order for {symbol}: {e}")
+                print(f"[ERROR] Order execution failed for {symbol}: {e}")
 
 # ==========================================
 # 8. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting automated-management Order Block & Macro trading cycle...")
+    print("Starting bulletproof trading execution cycle...")
     
-    # 1. Automated Regime Filter: Check if market environment is safe before doing anything
     if not market_regime_is_safe():
-        print("[TERMINATION] Red light active. Script exiting safely with zero orders placed.")
+        print("[TERMINATION] Red light active. Exiting safely.")
         sys.exit(0)
         
     try:
         manage_open_positions()
     except Exception as e:
-        print(f"[WARNING] Position management encountered an error: {e}")
+        print(f"[WARNING] Position manager warning: {e}")
     
-    try:
-        macro_data = fetch_and_verify_macro_news()
-    except Exception:
-        macro_data = {"macro_sentiment_score": 0.0, "verified_headlines": [], "summary_reasoning": "Error fallback."}
+    # Force live web check; defaults to safe hostile block if any error occurs
+    macro_data = fetch_and_verify_macro_news()
     
     try:
         ranked_watchlist = deterministic_pre_screen(SYMBOLS)
-        print(f"[INFO] Watchlist pre-screened candidates: {ranked_watchlist}")
         execute_trades(ranked_watchlist, macro_data)
     except Exception as e:
-        print(f"[WARNING] Cycle completed with warnings: {e}")
+        print(f"[WARNING] Cycle warning: {e}")
         
-    print("Agent cycle completed successfully.")
+    print("Cycle completed safely.")
     sys.exit(0)
