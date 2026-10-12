@@ -48,10 +48,10 @@ SYMBOLS = ["QQQ", "AAPL", "NVDA", "MSFT", "META", "GOOGL"]
 NOTIONAL_PER_TRADE = 1000.0
 
 # ==========================================
-# 2. AUTOMATED REGIME & VOLATILITY FILTER
+# 2. AUTOMATED REGIME FILTER (MATHEMATICAL)
 # ==========================================
 def market_regime_is_safe():
-    print("[REGIME FILTER] Evaluating market structure and trend volatility on QQQ...")
+    print("[REGIME FILTER] Evaluating market structure and volatility on QQQ...")
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=60)
@@ -79,9 +79,9 @@ def market_regime_is_safe():
         
         spread = abs(sma_20 - sma_50) / current_price
         
-        # Hard check for compressed, choppy sideways chop
+        # Hard check for choppy, sideways compression
         if spread < 0.005:
-            print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Halting execution.")
+            print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Choppy regime detected.")
             return False
             
         print(f"[REGIME FILTER] 🟢 GREEN LIGHT: Trend structure is stable (Spread: {spread:.4f}).")
@@ -91,23 +91,23 @@ def market_regime_is_safe():
         return False
 
 # ==========================================
-# 3. LIVE WEB-SEARCH MACRO & YIELD AUDITOR
+# 3. GEMINI LIVE INTERNET NEWS & MACRO CHECK
 # ==========================================
 def fetch_and_verify_macro_news():
-    print("[MACRO AGENT] Querying live financial news, Treasury yields, and geopolitical risk via Gemini Web Search...")
+    print("[MACRO AGENT] Querying live financial news, Treasury yields, and macro catalysts via Gemini Web Search...")
     
     prompt = (
-        "Search the live web right now for current U.S. Treasury 10-year yields, Federal Reserve statements, "
-        "crude oil price movements, and major market risk factors over the last 24 hours.\n"
-        "Evaluate whether macro market conditions are safe for long equity momentum strategies or if there is a severe risk-off panic.\n"
-        "Calculate a macro sentiment score from -1.0 (extreme risk-off crash/high yield panic) to +1.0 (strong risk-on/bullish).\n"
+        "Search the live web right now for current U.S. Treasury yields, Federal Reserve statements, "
+        "interest rate shocks, and major market risk factors over the last 24 hours.\n"
+        "Determine if macro market conditions present a severe risk-off panic or high-yield crash environment.\n"
+        "Calculate a macro sentiment score from -1.0 (extreme risk-off panic / yield spike) to +1.0 (strong risk-on / stable).\n"
         "Respond strictly in JSON format with keys: 'macro_sentiment_score' (float), "
         "'verified_headlines' (list of strings), and 'summary_reasoning' (string)."
     )
     
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-flash-latest",
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -116,12 +116,12 @@ def fetch_and_verify_macro_news():
             )
         )
         data = json.loads(response.text)
-        score = float(data.get('macro_sentiment_score', -1.0)) # Default to hostile if unreadable
+        score = float(data.get('macro_sentiment_score', -1.0))
         print(f"[MACRO AGENT] Live Web Macro Sentiment Score: {score}")
         print(f"[MACRO AGENT] Reasoning: {data.get('summary_reasoning')}")
         return data
     except Exception as e:
-        print(f"[CRITICAL SAFETY WARNING] Live macro web search failed: {e}. Defaulting to HOSTILE macro score (-1.0) to prevent losses.")
+        print(f"[CRITICAL SAFETY WARNING] Live macro web search failed: {e}. Defaulting to HOSTILE score (-1.0).")
         return {
             "macro_sentiment_score": -1.0, 
             "verified_headlines": ["API Error / Search Failure"], 
@@ -129,7 +129,7 @@ def fetch_and_verify_macro_news():
         }
 
 # ==========================================
-# 4. ICT / ORDER BLOCK & SMC ENGINE
+# 4. ICT / SMC ORDER BLOCK ENGINE
 # ==========================================
 def get_market_data(symbol):
     try:
@@ -222,7 +222,6 @@ def deterministic_pre_screen(symbols):
                 current_open = df['open'].iloc[-1]
                 
                 intraday_momentum_positive = current_price >= current_open
-                
                 sma_20 = df['SMA_20'].iloc[-1]
                 sma_50 = df['SMA_50'].iloc[-1]
                 is_bullish_trend = (current_price > sma_20) and (sma_20 > sma_50)
@@ -257,53 +256,28 @@ def deterministic_pre_screen(symbols):
     return candidates
 
 # ==========================================
-# 5. ACTIVE POSITION RISK MANAGER
-# ==========================================
-def manage_open_positions():
-    print("[POSITION MANAGER] Evaluating active positions for early risk exits...")
-    try:
-        positions = trading_client.get_all_positions()
-    except Exception as e:
-        print(f"[WARNING] Could not fetch positions: {e}")
-        return
-
-    for p in positions:
-        symbol = p.symbol
-        current_price = float(p.current_price)
-        unrealized_plpc = float(p.unrealized_plpc)
-        
-        df = get_market_data(symbol)
-        if df is not None and len(df) > 50:
-            df, bisi, valid_ob, is_discount, atr, swing_low = detect_order_blocks_and_smc(df)
-            trend_lost = current_price < df['SMA_20'].iloc[-1]
-            
-            if trend_lost or unrealized_plpc < -0.01:
-                print(f"[EMERGENCY EXIT] Cutting losses on {symbol} due to trend failure or drawdown limit.")
-                try:
-                    trading_client.close_position(symbol_or_asset_id=symbol)
-                except Exception as e:
-                    print(f"[ERROR] Failed to close position {symbol}: {e}")
-
-# ==========================================
-# 6. GROQ AI RISK AUDITOR
+# 5. GROQ AI AUDITOR (STRICT RULE CHECKER)
 # ==========================================
 def groq_ai_risk_veto(candidate, macro_data):
-    print(f"[GROQ RISK AGENT] Auditing {candidate['symbol']} setup...")
+    print(f"[GROQ RISK AUDITOR] Running validation audit for {candidate['symbol']}...")
     
     macro_score = macro_data.get("macro_sentiment_score", -1.0)
     headlines = macro_data.get("verified_headlines", [])
     
     prompt = (
-        f"You are an ultra-conservative risk management AI controller. Capital preservation is your only directive.\n"
-        f"Evaluate this trade setup against live web-scraped macro data:\n\n"
+        f"You are a strict, skeptical risk management compliance auditor. Your mandate is capital preservation.\n"
+        f"Audit this trade setup against live web-scraped macro data and technical rules:\n\n"
         f"- Symbol: {candidate['symbol']}\n"
-        f"- Bullish Trend: {candidate['bullish_trend']}\n"
+        f"- Bullish Trend Active: {candidate['bullish_trend']}\n"
         f"- Intraday Momentum Positive: {candidate['intraday_momentum_positive']}\n"
         f"- Risk/Reward Ratio: {candidate['risk_reward_ratio']}\n"
         f"- Order Block Respected: {candidate['order_block_respected']}\n"
         f"- Live Macro Sentiment Score (-1 to 1): {macro_score}\n"
         f"- Recent Headlines: {json.dumps(headlines)}\n\n"
-        "If macro conditions show high yields, panic, or negative sentiment, VETO immediately.\n"
+        "VETO the trade (approve: false) if:\n"
+        "1. Macro sentiment score is below 0.0.\n"
+        "2. The order block mean threshold is violated or intraday momentum is negative.\n"
+        "3. Any macro headline indicates yield spikes, Fed panic, or broad market liquidation.\n\n"
         "Respond strictly in JSON format with keys: 'approve' (boolean), and 'reasoning' (string)."
     )
     
@@ -311,25 +285,25 @@ def groq_ai_risk_veto(candidate, macro_data):
         completion = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a skeptical risk auditor. Output only valid JSON."},
+                {"role": "system", "content": "You are a rigid risk compliance auditor. Output only valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
             temperature=0.0
         )
         result = json.loads(completion.choices[0].message.content)
+        print(f"[GROQ AUDIT] Decision for {candidate['symbol']} -> Approve: {result.get('approve')} | Reason: {result.get('reasoning')}")
         return result.get('approve', False)
     except Exception as e:
-        print(f"[WARNING] Groq audit failed, defaulting to veto: {e}")
+        print(f"[WARNING] Groq audit failed, defaulting to veto for safety: {e}")
         return False
 
 # ==========================================
-# 7. EXECUTION ENGINE
+# 6. EXECUTION ENGINE
 # ==========================================
 def execute_trades(candidates, macro_data):
     macro_score = macro_data.get("macro_sentiment_score", -1.0)
     
-    # HARD MACRO CIRCUIT BREAKER: Refuse all trades if macro score is below 0.0
     if macro_score < 0.0:
         print(f"[CIRCUIT BREAKER] 🔴 MACRO LOCKOUT ACTIVE: Sentiment score ({macro_score}) indicates hostile conditions. Zero orders allowed.")
         return
@@ -340,14 +314,14 @@ def execute_trades(candidates, macro_data):
         positions = []
 
     if len(positions) >= 2:
-        print("[EXECUTION] Position limit reached. Skipping.")
+        print("[EXECUTION] Position limit reached. Skipping new trades.")
         return
 
     for candidate in candidates:
         if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] > 1.3 and candidate['order_block_detected']:
             
             if not groq_ai_risk_veto(candidate, macro_data):
-                print(f"[EXECUTION] Trade VETOED for {candidate['symbol']}.")
+                print(f"[EXECUTION] Trade VETOED by Groq Auditor for {candidate['symbol']}.")
                 continue
 
             symbol = candidate['symbol']
@@ -358,7 +332,7 @@ def execute_trades(candidates, macro_data):
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
                     take_profit=TakeProfitRequest(limit_price=candidate['suggested_take_profit']),
-                    stop_loss=StopLossRequest(stop_press=candidate['suggested_stop_loss']) if 'suggested_stop_loss' in candidate else None
+                    stop_loss=StopLossRequest(stop_price=candidate['suggested_stop_loss'])
                 )
                 order = trading_client.submit_order(order_data=order_data)
                 print(f"[SUCCESS] Protected order submitted for {symbol}: {order.id}")
@@ -367,21 +341,15 @@ def execute_trades(candidates, macro_data):
                 print(f"[ERROR] Order execution failed for {symbol}: {e}")
 
 # ==========================================
-# 8. MAIN CONTROLLER LOOP
+# 7. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting bulletproof trading execution cycle...")
+    print("Starting audited execution cycle...")
     
     if not market_regime_is_safe():
-        print("[TERMINATION] Red light active. Exiting safely.")
+        print("[TERMINATION] Red light active. Exiting safely with zero orders placed.")
         sys.exit(0)
         
-    try:
-        manage_open_positions()
-    except Exception as e:
-        print(f"[WARNING] Position manager warning: {e}")
-    
-    # Force live web check; defaults to safe hostile block if any error occurs
     macro_data = fetch_and_verify_macro_news()
     
     try:
