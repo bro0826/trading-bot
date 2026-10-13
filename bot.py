@@ -44,15 +44,15 @@ except Exception as e:
     print(f"[CRITICAL ERROR] Gemini client initialization failed: {e}")
     sys.exit(1)
 
-# Diversified cross-sector watchlist to avoid tech-only drawdown traps
+# Diversified cross-sector watchlist
 SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "XLE", "XOM", "COP"]
 NOTIONAL_PER_TRADE = 1000.0
 
 # ==========================================
-# 2. AUTOMATED REGIME FILTER (MATHEMATICAL)
+# 2. AUTOMATED REGIME FILTER
 # ==========================================
 def market_regime_is_safe():
-    print("[REGIME FILTER] Evaluating broader market structure and volatility on SPY/QQQ...")
+    print("[REGIME FILTER] Evaluating broader market structure and volatility on SPY...")
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=60)
@@ -80,7 +80,6 @@ def market_regime_is_safe():
         
         spread = abs(sma_20 - sma_50) / current_price
         
-        # Hard check for choppy, sideways compression
         if spread < 0.004:
             print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Choppy regime detected.")
             return False
@@ -257,10 +256,87 @@ def deterministic_pre_screen(symbols):
     return candidates
 
 # ==========================================
-# 5. GROQ AI AUDITOR (STRICT RULE CHECKER)
+# 5. GROQ ACTIVE POSITION EMERGENCY AUDITOR
+# ==========================================
+def groq_audit_open_positions(macro_data):
+    print("[POSITION AUDITOR] Consulting Groq API for emergency pull checks on active positions...")
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as e:
+        print(f"[WARNING] Could not fetch open positions: {e}")
+        return
+
+    if not positions:
+        print("[POSITION AUDITOR] No active positions to monitor.")
+        return
+
+    macro_score = macro_data.get("macro_sentiment_score", -1.0)
+
+    for p in positions:
+        symbol = p.symbol
+        current_price = float(p.current_price)
+        avg_entry = float(p.avg_entry_price)
+        unrealized_plpc = float(p.unrealized_plpc)
+        
+        df = get_market_data(symbol)
+        if df is None or len(df) < 50:
+            continue
+
+        df, bisi, valid_ob, is_discount, atr, swing_low = detect_order_blocks_and_smc(df)
+        sma_20 = df['SMA_20'].iloc[-1]
+        
+        prompt = (
+            f"You are a hyper-vigilant risk auditor managing open live trades. Capital preservation is paramount.\n"
+            f"Audit open position for emergency pull out:\n"
+            f"- Asset: {symbol}\n"
+            f"- Entry Price: {avg_entry}\n"
+            f"- Current Price: {current_price}\n"
+            f"- Unrealized P&L (%): {round(unrealized_plpc * 100, 2)}%\n"
+            f"- 20 SMA Support Level: {round(sma_20, 2)}\n"
+            f"- Macro Sentiment Score (-1 to 1): {macro_score}\n\n"
+            f"Instruct an EMERGENCY PULL (emergency_pull: true) if:\n"
+            f"1. Unrealized P&L is negative and price breaks below 20 SMA support.\n"
+            f"2. Macro sentiment score dropped below 0.0 while in this trade.\n"
+            f"3. Drawdown exceeds -1.0%.\n\n"
+            f"Respond strictly in JSON format with keys: 'emergency_pull' (boolean), and 'reasoning' (string)."
+        )
+
+        try:
+            completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": "You are a ruthless risk auditor. Output only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            result = json.loads(completion.choices[0].message.content)
+            should_pull = result.get('emergency_pull', False)
+            reason = result.get('reasoning', 'No reason provided')
+            
+            print(f"[GROQ POSITION AUDIT] {symbol} -> Emergency Pull: {should_pull} | Reason: {reason}")
+            
+            if should_pull:
+                print(f"[EMERGENCY PULL EXECUTION] Liquidating {symbol} immediately...")
+                trading_client.close_position(symbol_or_asset_id=symbol)
+                print(f"[SUCCESS] Position {symbol} closed safely.")
+                
+        except Exception as e:
+            print(f"[WARNING] Groq position audit failed for {symbol}: {e}. Executing fallback safety check...")
+            # Fallback mathematical circuit breaker if Groq API errors
+            if current_price < sma_20 or unrealized_plpc < -0.01:
+                print(f"[FALLBACK EMERGENCY EXIT] Closing {symbol} due to hard technical failure.")
+                try:
+                    trading_client.close_position(symbol_or_asset_id=symbol)
+                except Exception as ex:
+                    print(f"[ERROR] Emergency close failed: {ex}")
+
+# ==========================================
+# 6. GROQ AI AUDITOR (ENTRY RULE CHECKER)
 # ==========================================
 def groq_ai_risk_veto(candidate, macro_data):
-    print(f"[GROQ RISK AUDITOR] Running high-conviction audit for {candidate['symbol']}...")
+    print(f"[GROQ RISK AUDITOR] Running high-conviction entry audit for {candidate['symbol']}...")
     
     macro_score = macro_data.get("macro_sentiment_score", -1.0)
     headlines = macro_data.get("verified_headlines", [])
@@ -276,9 +352,9 @@ def groq_ai_risk_veto(candidate, macro_data):
         f"- Live Macro Sentiment Score (-1 to 1): {macro_score}\n"
         f"- Recent Headlines: {json.dumps(headlines)}\n\n"
         "VETO the trade (approve: false) if:\n"
-        "1. Macro sentiment score is below 0.1 (must show positive stabilization).\n"
-        "2. The Risk/Reward ratio is below 1.8.\n"
-        "3. The order block mean threshold is compromised or intraday momentum is weak.\n\n"
+        "1. Macro sentiment score is below 0.1.\n"
+        "2. Risk/Reward ratio is below 1.8.\n"
+        "3. Order block mean threshold is compromised or momentum is weak.\n\n"
         "Respond strictly in JSON format with keys: 'approve' (boolean), and 'reasoning' (string)."
     )
     
@@ -296,11 +372,11 @@ def groq_ai_risk_veto(candidate, macro_data):
         print(f"[GROQ AUDIT] Decision for {candidate['symbol']} -> Approve: {result.get('approve')} | Reason: {result.get('reasoning')}")
         return result.get('approve', False)
     except Exception as e:
-        print(f"[WARNING] Groq audit failed, defaulting to veto for safety: {e}")
+        print(f"[WARNING] Groq entry audit failed, defaulting to veto: {e}")
         return False
 
 # ==========================================
-# 6. EXECUTION ENGINE
+# 7. EXECUTION ENGINE
 # ==========================================
 def execute_trades(candidates, macro_data):
     macro_score = macro_data.get("macro_sentiment_score", -1.0)
@@ -319,7 +395,6 @@ def execute_trades(candidates, macro_data):
         return
 
     for candidate in candidates:
-        # Enforce a stricter minimum R:R of 1.8 to avoid low-quality choppy entries
         if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] >= 1.8 and candidate['order_block_detected']:
             
             if not groq_ai_risk_veto(candidate, macro_data):
@@ -340,25 +415,4 @@ def execute_trades(candidates, macro_data):
                 print(f"[SUCCESS] High-conviction protected order submitted for {symbol}: {order.id}")
                 break 
             except Exception as e:
-                print(f"[ERROR] Order execution failed for {symbol}: {e}")
-
-# ==========================================
-# 7. MAIN CONTROLLER LOOP
-# ==========================================
-if __name__ == "__main__":
-    print("Starting multi-sector audited execution cycle...")
-    
-    if not market_regime_is_safe():
-        print("[TERMINATION] Red light active. Exiting safely with zero orders placed.")
-        sys.exit(0)
-        
-    macro_data = fetch_and_verify_macro_news()
-    
-    try:
-        ranked_watchlist = deterministic_pre_screen(SYMBOLS)
-        execute_trades(ranked_watchlist, macro_data)
-    except Exception as e:
-        print(f"[WARNING] Cycle warning: {e}")
-        
-    print("Cycle completed safely.")
-    sys.exit(0)
+                print(f"[ERROR] Order execution failed for {
