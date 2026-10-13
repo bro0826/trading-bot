@@ -22,6 +22,8 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+LOCK_FILE = "daily_circuit_breaker.lock"
+
 try:
     trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
     data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
@@ -44,12 +46,46 @@ except Exception as e:
     print(f"[CRITICAL ERROR] Gemini client initialization failed: {e}")
     sys.exit(1)
 
-# Diversified cross-sector watchlist
 SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "XLE", "XOM", "COP"]
 NOTIONAL_PER_TRADE = 1000.0
+MAX_DAILY_DRAWDOWN_PCT = 0.015  # 1.5% max account loss threshold per day
 
 # ==========================================
-# 2. AUTOMATED REGIME FILTER
+# 2. DAILY ACCOUNT-LEVEL CIRCUIT BREAKER
+# ==========================================
+def check_daily_account_drawdown():
+    print("[CIRCUIT BREAKER] Auditing total account equity and daily loss limit...")
+    
+    # Check if lock file exists from earlier today
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE, "r") as f:
+            lock_date = f.read().strip()
+        if lock_date == datetime.now().strftime("%Y-%m-%d"):
+            print(f"[CIRCUIT BREAKER] 🔴 HARD LOCKOUT ACTIVE: Account hit daily loss limit on {lock_date}. Execution stopped.")
+            return False
+
+    try:
+        account = trading_client.get_account()
+        equity = float(account.equity)
+        last_equity = float(account.last_equity)
+        
+        daily_pnl_pct = (equity - last_equity) / last_equity if last_equity > 0 else 0.0
+        print(f"[CIRCUIT BREAKER] Today's Account Equity Change: {daily_pnl_pct * 100:.2f}%")
+        
+        if daily_pnl_pct <= -MAX_DAILY_DRAWDOWN_PCT:
+            print(f"[CIRCUIT BREAKER] 🔴 MAX DAILY DRAWDOWN HIT ({daily_pnl_pct * 100:.2f}%). Writing lock file and terminating.")
+            with open(LOCK_FILE, "w") as f:
+                f.write(datetime.now().strftime("%Y-%m-%d"))
+            return False
+            
+        print("[CIRCUIT BREAKER] 🟢 Account drawdown is within safe limits.")
+        return True
+    except Exception as e:
+        print(f"[WARNING] Account check failed: {e}. Defaulting to safe continuation.")
+        return True
+
+# ==========================================
+# 3. REGIME FILTER (MARKET VOLATILITY)
 # ==========================================
 def market_regime_is_safe():
     print("[REGIME FILTER] Evaluating broader market structure and volatility on SPY...")
@@ -91,7 +127,7 @@ def market_regime_is_safe():
         return False
 
 # ==========================================
-# 3. GEMINI LIVE INTERNET NEWS & MACRO CHECK
+# 4. GEMINI LIVE INTERNET NEWS & MACRO CHECK
 # ==========================================
 def fetch_and_verify_macro_news():
     print("[MACRO AGENT] Querying live financial news, Treasury yields, and macro catalysts via Gemini Web Search...")
@@ -129,7 +165,7 @@ def fetch_and_verify_macro_news():
         }
 
 # ==========================================
-# 4. ICT / SMC ORDER BLOCK ENGINE
+# 5. ICT / SMC ORDER BLOCK ENGINE
 # ==========================================
 def get_market_data(symbol):
     try:
@@ -256,7 +292,7 @@ def deterministic_pre_screen(symbols):
     return candidates
 
 # ==========================================
-# 5. GROQ ACTIVE POSITION EMERGENCY AUDITOR
+# 6. GROQ ACTIVE POSITION EMERGENCY AUDITOR
 # ==========================================
 def groq_audit_open_positions(macro_data):
     print("[POSITION AUDITOR] Consulting Groq API for emergency pull checks on active positions...")
@@ -333,7 +369,7 @@ def groq_audit_open_positions(macro_data):
                     print(f"[ERROR] Emergency close failed: {ex}")
 
 # ==========================================
-# 6. GROQ AI AUDITOR (ENTRY RULE CHECKER)
+# 7. GROQ AI AUDITOR (ENTRY RULE CHECKER)
 # ==========================================
 def groq_ai_risk_veto(candidate, macro_data):
     print(f"[GROQ RISK AUDITOR] Running high-conviction entry audit for {candidate['symbol']}...")
@@ -376,7 +412,7 @@ def groq_ai_risk_veto(candidate, macro_data):
         return False
 
 # ==========================================
-# 7. EXECUTION ENGINE
+# 8. EXECUTION ENGINE
 # ==========================================
 def execute_trades(candidates, macro_data):
     macro_score = macro_data.get("macro_sentiment_score", -1.0)
@@ -415,4 +451,36 @@ def execute_trades(candidates, macro_data):
                 print(f"[SUCCESS] High-conviction protected order submitted for {symbol}: {order.id}")
                 break 
             except Exception as e:
-                print(f"[ERROR] Order execution failed for {
+                print(f"[ERROR] Order execution failed for {symbol}: {e}")
+
+# ==========================================
+# 9. MAIN CONTROLLER LOOP
+# ==========================================
+if __name__ == "__main__":
+    print("Starting hardened multi-sector audited execution cycle...")
+    
+    # Check account drawdown lock first
+    if not check_daily_account_drawdown():
+        sys.exit(0)
+        
+    if not market_regime_is_safe():
+        print("[TERMINATION] Red light active. Exiting safely with zero orders placed.")
+        sys.exit(0)
+        
+    macro_data = fetch_and_verify_macro_news()
+    
+    # 1. Audit active open positions via Groq API for emergency pull outs
+    try:
+        groq_audit_open_positions(macro_data)
+    except Exception as e:
+        print(f"[WARNING] Position audit warning: {e}")
+        
+    # 2. Screen watchlist and execute new trades if green-lit
+    try:
+        ranked_watchlist = deterministic_pre_screen(SYMBOLS)
+        execute_trades(ranked_watchlist, macro_data)
+    except Exception as e:
+        print(f"[WARNING] Cycle warning: {e}")
+        
+    print("Cycle completed safely.")
+    sys.exit(0)
