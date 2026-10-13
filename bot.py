@@ -44,19 +44,20 @@ except Exception as e:
     print(f"[CRITICAL ERROR] Gemini client initialization failed: {e}")
     sys.exit(1)
 
-SYMBOLS = ["QQQ", "AAPL", "NVDA", "MSFT", "META", "GOOGL"]
+# Diversified cross-sector watchlist to avoid tech-only drawdown traps
+SYMBOLS = ["SPY", "QQQ", "AAPL", "NVDA", "XLE", "XOM", "COP"]
 NOTIONAL_PER_TRADE = 1000.0
 
 # ==========================================
 # 2. AUTOMATED REGIME FILTER (MATHEMATICAL)
 # ==========================================
 def market_regime_is_safe():
-    print("[REGIME FILTER] Evaluating market structure and volatility on QQQ...")
+    print("[REGIME FILTER] Evaluating broader market structure and volatility on SPY/QQQ...")
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=60)
         request_params = StockBarsRequest(
-            symbol_or_symbols="QQQ",
+            symbol_or_symbols="SPY",
             timeframe=TimeFrame.Day,
             start=start_date,
             end=end_date
@@ -64,7 +65,7 @@ def market_regime_is_safe():
         bars = data_client.get_stock_bars(request_params)
         df = bars.df
         if df is None or df.empty:
-            print("[WARNING] Could not fetch QQQ bars. Triggering emergency RED LIGHT.")
+            print("[WARNING] Could not fetch SPY bars. Triggering emergency RED LIGHT.")
             return False
             
         if isinstance(df.index, pd.MultiIndex):
@@ -80,7 +81,7 @@ def market_regime_is_safe():
         spread = abs(sma_20 - sma_50) / current_price
         
         # Hard check for choppy, sideways compression
-        if spread < 0.005:
+        if spread < 0.004:
             print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Choppy regime detected.")
             return False
             
@@ -98,7 +99,7 @@ def fetch_and_verify_macro_news():
     
     prompt = (
         "Search the live web right now for current U.S. Treasury yields, Federal Reserve statements, "
-        "interest rate shocks, and major market risk factors over the last 24 hours.\n"
+        "oil price shocks, sector rotations, and major market risk factors over the last 24 hours.\n"
         "Determine if macro market conditions present a severe risk-off panic or high-yield crash environment.\n"
         "Calculate a macro sentiment score from -1.0 (extreme risk-off panic / yield spike) to +1.0 (strong risk-on / stable).\n"
         "Respond strictly in JSON format with keys: 'macro_sentiment_score' (float), "
@@ -259,25 +260,25 @@ def deterministic_pre_screen(symbols):
 # 5. GROQ AI AUDITOR (STRICT RULE CHECKER)
 # ==========================================
 def groq_ai_risk_veto(candidate, macro_data):
-    print(f"[GROQ RISK AUDITOR] Running validation audit for {candidate['symbol']}...")
+    print(f"[GROQ RISK AUDITOR] Running high-conviction audit for {candidate['symbol']}...")
     
     macro_score = macro_data.get("macro_sentiment_score", -1.0)
     headlines = macro_data.get("verified_headlines", [])
     
     prompt = (
-        f"You are a strict, skeptical risk management compliance auditor. Your mandate is capital preservation.\n"
-        f"Audit this trade setup against live web-scraped macro data and technical rules:\n\n"
+        f"You are an ultra-conservative risk management compliance auditor. Capital preservation is your sole priority.\n"
+        f"Audit this trade setup against macro conditions and strict technical requirements:\n\n"
         f"- Symbol: {candidate['symbol']}\n"
         f"- Bullish Trend Active: {candidate['bullish_trend']}\n"
         f"- Intraday Momentum Positive: {candidate['intraday_momentum_positive']}\n"
-        f"- Risk/Reward Ratio: {candidate['risk_reward_ratio']}\n"
+        f"- Risk/Reward Ratio (Must be >= 1.8): {candidate['risk_reward_ratio']}\n"
         f"- Order Block Respected: {candidate['order_block_respected']}\n"
         f"- Live Macro Sentiment Score (-1 to 1): {macro_score}\n"
         f"- Recent Headlines: {json.dumps(headlines)}\n\n"
         "VETO the trade (approve: false) if:\n"
-        "1. Macro sentiment score is below 0.0.\n"
-        "2. The order block mean threshold is violated or intraday momentum is negative.\n"
-        "3. Any macro headline indicates yield spikes, Fed panic, or broad market liquidation.\n\n"
+        "1. Macro sentiment score is below 0.1 (must show positive stabilization).\n"
+        "2. The Risk/Reward ratio is below 1.8.\n"
+        "3. The order block mean threshold is compromised or intraday momentum is weak.\n\n"
         "Respond strictly in JSON format with keys: 'approve' (boolean), and 'reasoning' (string)."
     )
     
@@ -318,7 +319,8 @@ def execute_trades(candidates, macro_data):
         return
 
     for candidate in candidates:
-        if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] > 1.3 and candidate['order_block_detected']:
+        # Enforce a stricter minimum R:R of 1.8 to avoid low-quality choppy entries
+        if candidate['bullish_trend'] and candidate['intraday_momentum_positive'] and candidate['risk_reward_ratio'] >= 1.8 and candidate['order_block_detected']:
             
             if not groq_ai_risk_veto(candidate, macro_data):
                 print(f"[EXECUTION] Trade VETOED by Groq Auditor for {candidate['symbol']}.")
@@ -335,7 +337,7 @@ def execute_trades(candidates, macro_data):
                     stop_loss=StopLossRequest(stop_price=candidate['suggested_stop_loss'])
                 )
                 order = trading_client.submit_order(order_data=order_data)
-                print(f"[SUCCESS] Protected order submitted for {symbol}: {order.id}")
+                print(f"[SUCCESS] High-conviction protected order submitted for {symbol}: {order.id}")
                 break 
             except Exception as e:
                 print(f"[ERROR] Order execution failed for {symbol}: {e}")
@@ -344,7 +346,7 @@ def execute_trades(candidates, macro_data):
 # 7. MAIN CONTROLLER LOOP
 # ==========================================
 if __name__ == "__main__":
-    print("Starting audited execution cycle...")
+    print("Starting multi-sector audited execution cycle...")
     
     if not market_regime_is_safe():
         print("[TERMINATION] Red light active. Exiting safely with zero orders placed.")
