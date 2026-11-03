@@ -56,7 +56,6 @@ MAX_DAILY_DRAWDOWN_PCT = 0.015  # 1.5% max account loss threshold per day
 def check_daily_account_drawdown():
     print("[CIRCUIT BREAKER] Auditing total account equity and daily loss limit...")
     
-    # Check if lock file exists from earlier today
     if os.path.exists(LOCK_FILE):
         with open(LOCK_FILE, "r") as f:
             lock_date = f.read().strip()
@@ -85,45 +84,73 @@ def check_daily_account_drawdown():
         return True
 
 # ==========================================
-# 3. REGIME FILTER (MARKET VOLATILITY)
+# 3. REGIME FILTER & INTRADAY CURVE GATEKEEPER
 # ==========================================
 def market_regime_is_safe():
-    print("[REGIME FILTER] Evaluating broader market structure and volatility on SPY...")
+    print("[REGIME FILTER] Evaluating broader market structure and intraday QQQ curve safety...")
     try:
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=60)
-        request_params = StockBarsRequest(
+        
+        # A. Check Daily SPY Trend Structure (Macro Direction)
+        start_date_daily = end_date - timedelta(days=60)
+        daily_params = StockBarsRequest(
             symbol_or_symbols="SPY",
             timeframe=TimeFrame.Day,
-            start=start_date,
+            start=start_date_daily,
             end=end_date
         )
-        bars = data_client.get_stock_bars(request_params)
-        df = bars.df
-        if df is None or df.empty:
-            print("[WARNING] Could not fetch SPY bars. Triggering emergency RED LIGHT.")
-            return False
-            
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.reset_index(level=0, drop=True)
-            
-        df['SMA_20'] = df['close'].rolling(window=20).mean()
-        df['SMA_50'] = df['close'].rolling(window=50).mean()
+        bars_daily = data_client.get_stock_bars(daily_params)
+        df_daily = bars_daily.df
         
-        current_price = df['close'].iloc[-1]
-        sma_20 = df['SMA_20'].iloc[-1]
-        sma_50 = df['SMA_50'].iloc[-1]
-        
-        spread = abs(sma_20 - sma_50) / current_price
-        
-        if spread < 0.004:
-            print(f"[REGIME FILTER] 🔴 RED LIGHT: Market is compressed (Spread: {spread:.4f}). Choppy regime detected.")
-            return False
+        if df_daily is not None and not df_daily.empty:
+            if isinstance(df_daily.index, pd.MultiIndex):
+                df_daily = df_daily.reset_index(level=0, drop=True)
+            df_daily['SMA_20'] = df_daily['close'].rolling(window=20).mean()
+            df_daily['SMA_50'] = df_daily['close'].rolling(window=50).mean()
             
-        print(f"[REGIME FILTER] 🟢 GREEN LIGHT: Trend structure is stable (Spread: {spread:.4f}).")
+            current_price = df_daily['close'].iloc[-1]
+            sma_20 = df_daily['SMA_20'].iloc[-1]
+            sma_50 = df_daily['SMA_50'].iloc[-1]
+            spread = abs(sma_20 - sma_50) / current_price
+            
+            if spread < 0.004:
+                print(f"[REGIME FILTER] 🔴 RED LIGHT: Market compressed (Spread: {spread:.4f}). Choppy regime.")
+                return False
+
+        # B. INTRADAY CURVE GATEKEEPER (Checks QQQ for sudden crashes / falling knives)
+        start_date_intraday = end_date - timedelta(days=3)
+        intraday_params = StockBarsRequest(
+            symbol_or_symbols="QQQ",
+            timeframe=TimeFrame.Minute_15,
+            start=start_date_intraday,
+            end=end_date
+        )
+        bars_intraday = data_client.get_stock_bars(intraday_params)
+        df_qqq = bars_intraday.df
+        
+        if df_qqq is not None and not df_qqq.empty:
+            if isinstance(df_qqq.index, pd.MultiIndex):
+                df_qqq = df_qqq.reset_index(level=0, drop=True)
+                
+            # Calculate session % change & institutional VWAP across the curve
+            df_qqq['session_pct_change'] = (df_qqq['close'] - df_qqq['open']) / df_qqq['open'] * 100
+            df_qqq['cumulative_pv'] = (df_qqq['close'] * df_qqq['volume']).cumsum()
+            df_qqq['cumulative_v'] = df_qqq['volume'].cumsum()
+            df_qqq['vwap'] = df_qqq['cumulative_pv'] / df_qqq['cumulative_v']
+            
+            latest_qqq = df_qqq.iloc[-1]
+            is_crashing = latest_qqq['session_pct_change'] < -1.0
+            below_vwap = latest_qqq['close'] < latest_qqq['vwap']
+            
+            if is_crashing or below_vwap:
+                print(f"[REGIME FILTER] 🔴 RED LIGHT: QQQ Intraday Crash Detected! "
+                      f"Change: {latest_qqq['session_pct_change']:.2f}% | Price vs VWAP: {latest_qqq['close']:.2f} vs {latest_qqq['vwap']:.2f}")
+                return False
+
+        print("[REGIME FILTER] 🟢 GREEN LIGHT: Daily trend and intraday QQQ curve are stable.")
         return True
     except Exception as e:
-        print(f"[WARNING] Regime filter exception: {e}. Defaulting to RED LIGHT.")
+        print(f"[WARNING] Regime filter exception: {e}. Defaulting to RED LIGHT for safety.")
         return False
 
 # ==========================================
@@ -360,7 +387,6 @@ def groq_audit_open_positions(macro_data):
                 
         except Exception as e:
             print(f"[WARNING] Groq position audit failed for {symbol}: {e}. Executing fallback safety check...")
-            # Fallback mathematical circuit breaker if Groq API errors
             if current_price < sma_20 or unrealized_plpc < -0.01:
                 print(f"[FALLBACK EMERGENCY EXIT] Closing {symbol} due to hard technical failure.")
                 try:
@@ -464,7 +490,7 @@ if __name__ == "__main__":
         sys.exit(0)
         
     if not market_regime_is_safe():
-        print("[TERMINATION] Red light active. Exiting safely with zero orders placed.")
+        print("[TERMINATION] Red light active (Regime or Intraday Curve Crash). Exiting safely with zero orders placed.")
         sys.exit(0)
         
     macro_data = fetch_and_verify_macro_news()
